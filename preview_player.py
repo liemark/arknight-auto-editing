@@ -1,5 +1,7 @@
 # preview_player.py — 视频预览播放器 v5
+# 架构：单一 VideoIO 线程持有唯一 cap，通过命令队列接收指令
 #   主线程  ──cmd_q──▶  VideoIO线程（唯一cap）──frame_q──▶  渲染循环（主线程）
+
 
 import tkinter as tk
 from tkinter import ttk
@@ -15,10 +17,11 @@ from frame_types import (FRAME_TYPE_NORMAL, FRAME_TYPE_PAUSE,
                           FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X)
 
 # VideoIO 命令类型
-_CMD_SEEK    = 'seek'    # {'type': seek,  'frame': int}
-_CMD_PLAY    = 'play'    # {'type': play,  'params': dict}
-_CMD_STOP    = 'stop'    # {'type': stop}
-_CMD_QUIT    = 'quit'    # {'type': quit}  — 关闭线程
+_CMD_SEEK        = 'seek'    # {'type': seek,  'frame': int}
+_CMD_SEEK_LATEST = 'seek_latest'  # 与 seek 相同，但 IO 线程处理前会丢弃旧的同类命令
+_CMD_PLAY        = 'play'    # {'type': play,  'params': dict}
+_CMD_STOP        = 'stop'    # {'type': stop}
+_CMD_QUIT        = 'quit'    # {'type': quit}  — 关闭线程
 
 
 class _VideoIOThread(threading.Thread):
@@ -214,18 +217,18 @@ class _VideoIOThread(threading.Thread):
             self._playing = False
             self._flush_frame_q()
 
-        elif t == _CMD_SEEK:
+        elif t == _CMD_SEEK or t == _CMD_SEEK_LATEST:
             self._playing = False
             self._flush_frame_q()
-            frame_idx = cmd['frame']
-            canvas_wh = cmd['canvas_wh']
+            frame_idx  = cmd['frame']
+            canvas_wh  = cmd['canvas_wh']
             pause_segs = cmd.get('pause_segs', [])
             skip_trim  = cmd.get('skip_trimmed', True)
 
-            # 跳过裁剪区
-            if skip_trim:
-                jumped = self._jump_pause(frame_idx, pause_segs)
-                frame_idx = jumped
+            # seek_latest 不跳过裁剪区（允许停在裁剪区内看画面）
+            # seek（普通，播放用）仍然跳过
+            if skip_trim and t == _CMD_SEEK:
+                frame_idx = self._jump_pause(frame_idx, pause_segs)
 
             self._seek_cap(frame_idx)
             ret, frame = self._read_one()
@@ -243,6 +246,19 @@ class _VideoIOThread(threading.Thread):
     # ------------------------------------------------------------------
     def send(self, cmd: dict):
         """外部调用：发送命令（线程安全）"""
+        if cmd['type'] == _CMD_SEEK_LATEST:
+            # 丢弃队列里所有积压的 seek_latest，只保留最新一条
+            # 用一个替换列表重建队列内容
+            kept = []
+            while True:
+                try:
+                    old = self.cmd_q.get_nowait()
+                    if old['type'] != _CMD_SEEK_LATEST:
+                        kept.append(old)   # 非 seek_latest 命令保留
+                except Empty:
+                    break
+            for c in kept:
+                self.cmd_q.put(c)
         self.cmd_q.put(cmd)
 
     def stop_and_join_io(self):
@@ -638,14 +654,17 @@ class VideoPreviewPlayer(tk.Frame):
 
         if self.active_handle and self.active_handle[0] == 'red':
             tf = self._x2f(event.x, w)
-            # 跳过裁剪区
-            if self.skip_trimmed.get():
-                for seg in self.pause_segments:
-                    if seg['trim_in'] <= tf < seg['trim_out']:
-                        tf = seg['trim_out']; break
+            # 拖动时允许进入裁剪区（用户主动操作）
+            # 发节流命令：IO线程只处理最新一条，丢弃积压的旧 seek_latest
             self.current_frame_idx = tf
-            # 发 seek（IO线程处理，不会崩溃）
-            self._send_seek(tf)
+            if self._io:
+                self._io.send({
+                    'type':         _CMD_SEEK_LATEST,
+                    'frame':        tf,
+                    'canvas_wh':    self._canvas_wh(),
+                    'pause_segs':   self._pause_segs_snapshot(),
+                    'skip_trimmed': False,   # 拖动不自动跳出裁剪区
+                })
             self._draw_pointer_only()
             return
 
@@ -690,9 +709,15 @@ class VideoPreviewPlayer(tk.Frame):
             self._draw_pointer_only()
 
     def _on_mouseup(self, event):
+        was_red = self.active_handle and self.active_handle[0] == 'red'
         self.active_handle       = None
         self._pending_candidates = []
         self._mousedown_x        = 0
+
+        # 红条松手：若正在播放，从当前位置重启播放
+        # 播放循环内的 _jump_pause 会自动跳出裁剪区
+        if was_red and self.is_playing:
+            self._send_play(self.current_frame_idx)
 
     def _on_scroll(self, event):
         if self.total_frames <= 0:
@@ -722,7 +747,18 @@ class VideoPreviewPlayer(tk.Frame):
     def _do_seek_click(self, event):
         w  = self.timeline_canvas.winfo_width()
         tf = self._x2f(event.x, w)
-        self._send_seek(tf)
+        # 点击直接 seek 到目标帧，不强制跳出裁剪区
+        # （允许用户查看裁剪区内容；播放时才自动跳出）
+        self.current_frame_idx = tf
+        if self._io:
+            self._io.send({
+                'type':         _CMD_SEEK_LATEST,
+                'frame':        tf,
+                'canvas_wh':    self._canvas_wh(),
+                'pause_segs':   self._pause_segs_snapshot(),
+                'skip_trimmed': False,
+            })
+        self._draw_pointer_only()
 
     # ==========================================================
     #  指针可见
