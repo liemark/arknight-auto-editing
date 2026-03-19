@@ -1,13 +1,5 @@
 # preview_player.py — 视频预览播放器 v5
-#
-# 架构：单一 VideoIO 线程持有唯一 cap，通过命令队列接收指令
 #   主线程  ──cmd_q──▶  VideoIO线程（唯一cap）──frame_q──▶  渲染循环（主线程）
-#
-# 解决：
-#   1. FFmpeg async_lock 崩溃：彻底消除多线程并发访问同一/多个cap
-#   2. 暂停帧露出：IO线程在seek后、read前先过滤裁剪区，帧绝不进队列
-#   3. 倍速：1x/2x/4x 三档，用grab跳帧，帧率固定=视频fps
-#   4. 卡顿：grab不解码，暂停区跳帧零解码开销
 
 import tkinter as tk
 from tkinter import ttk
@@ -349,7 +341,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.lbl_time = ttk.Label(ctrl, text="00:00 / 00:00")
         self.lbl_time.pack(side=tk.RIGHT, padx=10)
 
-        self.lbl_info = ttk.Label(self, text="就绪", foreground="#00CED1",
+        self.lbl_info = ttk.Label(self, text="滚轮缩放时间轴，右键拖动，黄色为暂停区域，可拖动选择保留/裁剪区域", foreground="#00CED1",
                                   font=("Consolas", 10))
         self.lbl_info.pack(fill=tk.X, padx=10, pady=2)
 

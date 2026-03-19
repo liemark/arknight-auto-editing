@@ -11,7 +11,7 @@ from preview_player import VideoPreviewPlayer
 
 def main():
     root = tk.Tk()
-    root.title("视频剪辑工具 v4")
+    root.title("明日方舟剪辑工具")
     root.geometry("1380x920")
     root.minsize(900, 600)
 

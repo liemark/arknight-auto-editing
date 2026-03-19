@@ -1,13 +1,4 @@
 # analyzer.py —— 模板加载 + 帧状态识别（无 GUI 依赖）
-#
-# 优化点：
-#   1. load_templates(proc_res) 预缩放模板和 ROI，每帧匹配时跳过 resize
-#   2. classify_frame 走缓存路径，_get_best_score 减少 ~4 次 resize/帧
-#   3. analyze_video 改用 ProcessPoolExecutor + initializer 模式：
-#      - 真正绕过 GIL，线性利用多核
-#      - configs/thresholds 在子进程 initializer 里初始化，
-#        不在每帧任务里 pickle 传输大数组，只传轻量 frame ndarray
-#   4. build_delete_set 换成 numpy 向量操作，省去 Python 级 for 循环
 
 import cv2
 import numpy as np
