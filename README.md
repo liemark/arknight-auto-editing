@@ -8,6 +8,10 @@
 还提供了时间轴用于暂停事件的精细化调整与视频预览  
 目前是纯python版本，瓶颈在H.264解码
 ```
+链接: https://pan.baidu.com/s/18YSZRhW4sWG3ucwXSDE-0g?pwd=2333  
+提取码: 2333
+```
+```
 cap.read
   视频解码 (BGR 原始尺寸)                                3.62 ms/帧  (276 fps)  
 Resize + ColorConvert  
