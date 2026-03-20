@@ -34,60 +34,42 @@ def load_templates(proc_res: tuple = (400, 225)) -> tuple[dict, int]:
     total = 0
 
     for ctype, dirs in TEMPLATE_DIRS.items():
-        src_dir = dirs['source_dir']
-        ref_dir = dirs['ref_dir']
-        if not os.path.exists(src_dir) or not os.path.exists(ref_dir):
-            continue
+        src_dir, ref_dir = dirs['source_dir'], dirs['ref_dir']
+        if not os.path.exists(src_dir) or not os.path.exists(ref_dir): continue
 
         src_files = [f for f in os.listdir(src_dir) if f.lower().endswith(IMG_EXTS)]
         ref_files = [f for f in os.listdir(ref_dir) if f.lower().endswith(IMG_EXTS)]
-        if not src_files or not ref_files:
-            continue
+        if not src_files or not ref_files: continue
 
         src_img = cv2.imread(os.path.join(src_dir, src_files[0]), cv2.IMREAD_GRAYSCALE)
-        if src_img is None:
-            continue
+        if src_img is None: continue
         sh, sw = src_img.shape
 
         for rf in ref_files:
             ref_img = cv2.imread(os.path.join(ref_dir, rf), cv2.IMREAD_GRAYSCALE)
-            if ref_img is None:
-                continue
+            if ref_img is None: continue
             rh, rw = ref_img.shape
-            if rh > sh or rw > sw:
-                print(f"[警告] 模板 {rf} ({rw}x{rh}) 大于源图 ({sw}x{sh})，跳过")
-                continue
 
             res = cv2.matchTemplate(src_img, ref_img, cv2.TM_CCOEFF_NORMED)
             _, _, _, max_loc = cv2.minMaxLoc(res)
             rx, ry = max_loc
             _, mask = cv2.threshold(ref_img, 10, 255, cv2.THRESH_BINARY)
 
-            scale_x = proc_res[0] / sw
-            scale_y = proc_res[1] / sh
+            scale_x, scale_y = proc_res[0] / sw, proc_res[1] / sh
             ext = 2.0
             erx = max(0, int(rx * scale_x - rw * scale_x * (ext - 1) / 2))
             ery = max(0, int(ry * scale_y - rh * scale_y * (ext - 1) / 2))
-            erw = int(rw * scale_x * ext)
-            erh = int(rh * scale_y * ext)
-            tw  = max(1, int(rw * scale_x))
-            th  = max(1, int(rh * scale_y))
-            t_r = cv2.resize(ref_img, (tw, th), interpolation=cv2.INTER_AREA)
-            m_r = cv2.resize(mask,    (tw, th), interpolation=cv2.INTER_NEAREST)
+            tw, th = max(1, int(rw * scale_x)), max(1, int(rh * scale_y))
 
             configs[ctype].append({
-                'template_gray':   ref_img,
-                'mask':            mask,
-                'roi_orig':        (rx, ry, rw, rh),
-                'source_res':      (sw, sh),
-                'name':            rf,
+                'roi_orig': (rx, ry, rw, rh),
+                'source_res': (sw, sh),
                 'cached_proc_res': proc_res,
-                'cached_roi':      (erx, ery, erw, erh),
-                'cached_t':        t_r,
-                'cached_m':        m_r,
+                'cached_roi': (erx, ery, int(rw * scale_x * ext), int(rh * scale_y * ext)),
+                'cached_t': cv2.resize(ref_img, (tw, th), interpolation=cv2.INTER_AREA),
+                'cached_m': cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST),
             })
             total += 1
-
     return configs, total
 
 
@@ -97,62 +79,33 @@ def load_templates(proc_res: tuple = (400, 225)) -> tuple[dict, int]:
 
 def _get_best_score(gray_frame: np.ndarray, templates: list, proc_res: tuple) -> float:
     max_score = -1.0
-    fh, fw    = gray_frame.shape
-
+    fh, fw = gray_frame.shape
     for t in templates:
-        if t.get('cached_proc_res') == proc_res:
-            erx, ery, erw, erh = t['cached_roi']
-            t_r = t['cached_t']
-            m_r = t['cached_m']
-            erw = min(fw - erx, erw)
-            erh = min(fh - ery, erh)
-        else:
-            sw, sh = t['source_res']
-            rx, ry, rw, rh = t['roi_orig']
-            scale_x = proc_res[0] / sw
-            scale_y = proc_res[1] / sh
-            ext = 2.0
-            erx = max(0, int(rx * scale_x - rw * scale_x * (ext - 1) / 2))
-            ery = max(0, int(ry * scale_y - rh * scale_y * (ext - 1) / 2))
-            erw = min(fw - erx, int(rw * scale_x * ext))
-            erh = min(fh - ery, int(rh * scale_y * ext))
-            tw  = max(1, int(rw * scale_x))
-            th  = max(1, int(rh * scale_y))
-            t_r = cv2.resize(t['template_gray'], (tw, th), interpolation=cv2.INTER_AREA)
-            m_r = cv2.resize(t['mask'],          (tw, th), interpolation=cv2.INTER_NEAREST)
+        erx, ery, erw, erh = t['cached_roi']
+        t_r, m_r = t['cached_t'], t['cached_m']
+        erw, erh = min(fw - erx, erw), min(fh - ery, erh)
 
-        if erw <= 0 or erh <= 0:
-            continue
+        if erw <= 0 or erh <= 0: continue
         roi = gray_frame[ery:ery + erh, erx:erx + erw]
-        th2, tw2 = t_r.shape
-        if roi.shape[0] < th2 or roi.shape[1] < tw2:
-            continue
+        if roi.shape[0] < t_r.shape[0] or roi.shape[1] < t_r.shape[1]: continue
 
         res = cv2.matchTemplate(roi, t_r, cv2.TM_CCOEFF_NORMED, mask=m_r)
         _, score, _, _ = cv2.minMaxLoc(res)
-        if np.isfinite(score):
-            max_score = max(max_score, score)
-
+        if np.isfinite(score): max_score = max(max_score, score)
     return max_score
 
 
 def _classify_gray(gray: np.ndarray, configs: dict,
                    thresholds: dict, proc_res: tuple) -> int:
     """对已缩放好的灰度图做模板匹配分类"""
-    if configs['pause'] and \
-            _get_best_score(gray, configs['pause'], proc_res) >= thresholds['pause']:
+    if configs['pause'] and _get_best_score(gray, configs['pause'], proc_res) >= thresholds['pause']:
         return FRAME_TYPE_PAUSE
-
-    x1s = _get_best_score(gray, configs['speed_1x'],   proc_res) if configs['speed_1x']   else -1.0
-    x2s = _get_best_score(gray, configs['speed_2x'],   proc_res) if configs['speed_2x']   else -1.0
-
+    x1s = _get_best_score(gray, configs['speed_1x'], proc_res) if configs['speed_1x'] else -1.0
+    x2s = _get_best_score(gray, configs['speed_2x'], proc_res) if configs['speed_2x'] else -1.0
     if x1s >= thresholds['speed_1x'] and x1s > x2s: return FRAME_TYPE_1X
     if x2s >= thresholds['speed_2x'] and x2s > x1s: return FRAME_TYPE_2X
-
-    if configs['speed_0_2x'] and \
-            _get_best_score(gray, configs['speed_0_2x'], proc_res) >= thresholds['speed_0_2x']:
+    if configs['speed_0_2x'] and _get_best_score(gray, configs['speed_0_2x'], proc_res) >= thresholds['speed_0_2x']:
         return FRAME_TYPE_0_2X
-
     return FRAME_TYPE_NORMAL
 
 
@@ -211,19 +164,13 @@ def _worker_classify_gray(gray: np.ndarray) -> int:
     3. 否则走 _classify_gray
     """
     global _worker_prev_roi, _worker_prev_state
-
     roi_strip = _extract_roi_strip(gray)
-
     if _worker_prev_roi is not None:
-        diff = float(np.mean(np.abs(roi_strip.astype(np.int16)
-                                    - _worker_prev_roi.astype(np.int16))))
-        if diff < _SAME_FRAME_THRESH:
-            _worker_prev_roi = roi_strip
-            return _worker_prev_state
+        diff = float(np.mean(np.abs(roi_strip.astype(np.int16) - _worker_prev_roi.astype(np.int16))))
+        if diff < _SAME_FRAME_THRESH: return _worker_prev_state
 
     state = _classify_gray(gray, _worker_configs, _worker_thresholds, _worker_proc_res)
-    _worker_prev_roi   = roi_strip
-    _worker_prev_state = state
+    _worker_prev_roi, _worker_prev_state = roi_strip, state
     return state
 
 
@@ -246,32 +193,43 @@ def analyze_video(video_path: str, configs: dict, thresholds: dict,
     import threading
     from queue import Queue as _Queue
 
-    cap   = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     states = np.zeros(total, dtype=np.int8)
-
     n_workers = min(n_threads, multiprocessing.cpu_count())
-    chunk     = max(8, min(32, batch_size // n_workers))
-    pw, ph    = proc_res
+    pw, ph = proc_res
 
-    # 读帧队列：(gray_ndarray, frame_idx) 或 None
-    read_q: _Queue = _Queue(maxsize=batch_size * 2)
+    # 预处理任务队列
+    preproc_q = _Queue(maxsize=batch_size * 2)
 
-    def _reader():
-        idx = 0
-        while idx < total:
-            ret, f = cap.read()
-            if not ret:
-                break
-            # 在读帧线程内完成 resize+cvtColor，只放灰度图进队列
-            gray = cv2.cvtColor(
-                cv2.resize(f, (pw, ph), interpolation=cv2.INTER_AREA),
-                cv2.COLOR_BGR2GRAY)
-            read_q.put((gray, idx))
-            idx += 1
-        read_q.put(None)
+    def _reader_and_preprocess():
+        """使用线程池并行处理 resize 和 cvtColor"""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as tp:
+            idx = 0
+            futures = []
+            while True:
+                ret, frame = cap.read()
+                if not ret: break
 
-    reader_thread = threading.Thread(target=_reader, daemon=True)
+                # 提交预处理任务到线程池
+                def process(f, i):
+                    g = cv2.cvtColor(cv2.resize(f, (pw, ph), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+                    return g, i
+
+                futures.append(tp.submit(process, frame, idx))
+                idx += 1
+
+                # 保持线程池和队列平衡，防止内存溢出
+                if len(futures) > 16:
+                    res = futures.pop(0).result()
+                    preproc_q.put(res)
+
+            # 清理剩余任务
+            for fut in futures:
+                preproc_q.put(fut.result())
+            preproc_q.put(None)
+
+    reader_thread = threading.Thread(target=_reader_and_preprocess, daemon=True)
     reader_thread.start()
 
     with concurrent.futures.ProcessPoolExecutor(
@@ -279,33 +237,28 @@ def analyze_video(video_path: str, configs: dict, thresholds: dict,
             initializer=_worker_init,
             initargs=(configs, thresholds, proc_res)) as ex:
 
-        batch_grays:   list = []
-        batch_indices: list = []
+        batch_grays, batch_indices = [], []
         done = False
-
         while not done:
             while len(batch_grays) < batch_size:
-                item = read_q.get()
+                item = preproc_q.get()
                 if item is None:
-                    done = True
+                    done = True;
                     break
                 gray, idx = item
-                batch_grays.append(gray)
+                batch_grays.append(gray);
                 batch_indices.append(idx)
 
-            if not batch_grays:
-                break
+            if not batch_grays: break
 
-            # 子进程只收灰度图
-            results = list(ex.map(_worker_classify_gray, batch_grays,
-                                  chunksize=chunk))
+            # 使用较大的 chunksize 减少 IPC 往返
+            chunk = max(4, len(batch_grays) // (n_workers * 2))
+            results = list(ex.map(_worker_classify_gray, batch_grays, chunksize=chunk))
+
             for idx, s in zip(batch_indices, results):
                 states[idx] = s
-
-            if progress_cb:
-                progress_cb(batch_indices[-1] / total)
-
-            batch_grays.clear()
+            if progress_cb: progress_cb(batch_indices[-1] / total)
+            batch_grays.clear();
             batch_indices.clear()
 
     reader_thread.join(timeout=5)
