@@ -1,5 +1,5 @@
 # arknight-auto-editing
-![alt text](https://github.com/liemark/arknight-auto-editing/blob/main/README.png)
+![alt text](https://github.com/liemark/arknight-auto-editing/blob/main/README.png)  
 明日方舟可视化剪暂停与变速工具  
 根据文件夹中的模板图片识别视频中每一帧的状态  
 并根据暂停事件前后的DCT差异与Hist相似度判断暂停事件如何保留  
