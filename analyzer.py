@@ -1,13 +1,4 @@
 # analyzer.py —— 模板加载 + 帧状态识别（无 GUI 依赖）
-#
-# 优化点：
-#   1. load_templates(proc_res) 预缩放模板和 ROI，每帧匹配时跳过 resize
-#   2. classify_frame 走缓存路径，_get_best_score 减少 ~4 次 resize/帧
-#   3. analyze_video 改用 ProcessPoolExecutor + initializer 模式：
-#      - 真正绕过 GIL，线性利用多核
-#      - configs/thresholds 在子进程 initializer 里初始化，
-#        不在每帧任务里 pickle 传输大数组，只传轻量 frame ndarray
-#   4. build_delete_set 换成 numpy 向量操作，省去 Python 级 for 循环
 
 import cv2
 import numpy as np
@@ -36,11 +27,8 @@ def load_templates(proc_res: tuple = (400, 225)) -> tuple[dict, int]:
     """
     加载所有模板并预缩放到 proc_res。
     每个模板条目包含：
-      - template_gray / mask：原始图（备用，proc_res 变化时回退）
-      - source_res / roi_orig：原始坐标
-      - cached_proc_res：缓存对应的 proc_res
-      - cached_roi (erx,ery,erw,erh)：预计算的 ROI 像素坐标
-      - cached_t / cached_m：预缩放后的模板和蒙版
+      cached_proc_res / cached_roi / cached_t / cached_m：
+        预计算的 ROI 坐标和缩放后模板，每帧匹配时直接用，跳过 resize。
     """
     configs: dict[str, list] = {k: [] for k in TEMPLATE_DIRS}
     total = 0
@@ -75,7 +63,6 @@ def load_templates(proc_res: tuple = (400, 225)) -> tuple[dict, int]:
             rx, ry = max_loc
             _, mask = cv2.threshold(ref_img, 10, 255, cv2.THRESH_BINARY)
 
-            # 预计算缩放后 ROI 和模板
             scale_x = proc_res[0] / sw
             scale_y = proc_res[1] / sh
             ext = 2.0
@@ -89,13 +76,11 @@ def load_templates(proc_res: tuple = (400, 225)) -> tuple[dict, int]:
             m_r = cv2.resize(mask,    (tw, th), interpolation=cv2.INTER_NEAREST)
 
             configs[ctype].append({
-                # 原始数据（proc_res 变化时回退用）
                 'template_gray':   ref_img,
                 'mask':            mask,
                 'roi_orig':        (rx, ry, rw, rh),
                 'source_res':      (sw, sh),
                 'name':            rf,
-                # 预缓存
                 'cached_proc_res': proc_res,
                 'cached_roi':      (erx, ery, erw, erh),
                 'cached_t':        t_r,
@@ -107,15 +92,14 @@ def load_templates(proc_res: tuple = (400, 225)) -> tuple[dict, int]:
 
 
 # ---------------------------------------------------------------
-#  单帧匹配（优先走预缓存路径）
+#  单帧匹配
 # ---------------------------------------------------------------
 
 def _get_best_score(gray_frame: np.ndarray, templates: list, proc_res: tuple) -> float:
     max_score = -1.0
-    fh, fw = gray_frame.shape
+    fh, fw    = gray_frame.shape
 
     for t in templates:
-        # 缓存命中：直接用预计算的 ROI 坐标和缩放后模板
         if t.get('cached_proc_res') == proc_res:
             erx, ery, erw, erh = t['cached_roi']
             t_r = t['cached_t']
@@ -123,7 +107,6 @@ def _get_best_score(gray_frame: np.ndarray, templates: list, proc_res: tuple) ->
             erw = min(fw - erx, erw)
             erh = min(fh - ery, erh)
         else:
-            # 回退：实时计算（proc_res 与加载时不同时）
             sw, sh = t['source_res']
             rx, ry, rw, rh = t['roi_orig']
             scale_x = proc_res[0] / sw
@@ -155,7 +138,7 @@ def _get_best_score(gray_frame: np.ndarray, templates: list, proc_res: tuple) ->
 
 def _classify_gray(gray: np.ndarray, configs: dict,
                    thresholds: dict, proc_res: tuple) -> int:
-    """对已缩放好的灰度图做模板匹配分类（内部函数，避免重复 resize）"""
+    """对已缩放好的灰度图做模板匹配分类"""
     if configs['pause'] and \
             _get_best_score(gray, configs['pause'], proc_res) >= thresholds['pause']:
         return FRAME_TYPE_PAUSE
@@ -183,29 +166,25 @@ def classify_frame(frame: np.ndarray, configs: dict,
 
 # ---------------------------------------------------------------
 #  子进程全局状态（ProcessPoolExecutor initializer 模式）
-#  configs/thresholds/proc_res 只在进程初始化时传一次，
-#  后续每帧任务只传轻量 frame ndarray，大幅减少 pickle 开销
 #
-#  帧缓存继承：相邻帧几乎完全相同时（如长暂停），直接复用上一帧结果，
-#  跳过 matchTemplate。对1帧暂停完全安全：状态切换时帧差必然超过阈值。
+#  子进程只接收已经 resize+cvtColor 过的灰度图（400×225×1），
+#  不接收原始 BGR 大帧（1920×1080×3）。
+#  pickle 体积从 ~6MB/帧 降到 ~90KB/帧，缓解 IPC 瓶颈。
+#
+#  帧缓存继承：连续相同帧跳过 matchTemplate，对1帧暂停安全。
 # ---------------------------------------------------------------
 
 _worker_configs:    dict  = {}
 _worker_thresholds: dict  = {}
 _worker_proc_res:   tuple = (400, 225)
-_worker_prev_roi:   object = None   # 上一帧的图标区域灰度（拼接后）
+_worker_prev_roi:   object = None
 _worker_prev_state: int   = FRAME_TYPE_NORMAL
 
-# 帧差只看图标所在的两块 ROI（400×225 坐标系），忽略游戏画面运动
-# ROI-A：pause 字母区域（中央偏下）
-# ROI-B：1x/2x 数字 + play 按钮（右上角）
-# 两块总像素 ~2750，比 16×9=144 大但仍远小于全帧 90000
-# 优点：游戏角色运动不影响这两块，false-positive 率极低
-_ROI_A = (180, 90, 260, 135)   # (x1,y1,x2,y2)
-_ROI_B = (325,  0, 400,  30)
+# 帧差只看图标 ROI（400×225 坐标系）
+_ROI_A = (180, 90, 260, 135)   # pause 字母区
+_ROI_B = (325,  0, 400,  30)   # 1x/2x + play 按钮（右上角）
 
-# ROI diff 阈值：编码噪声 ~0.67，图标出现/消失 >1.5，取 1.0 中间安全值
-_SAME_FRAME_THRESH = 1.0
+_SAME_FRAME_THRESH = 1.0   # 均值差阈值：编码噪声 ~0.67，图标变化 >1.5
 
 
 def _worker_init(configs: dict, thresholds: dict, proc_res: tuple):
@@ -219,25 +198,20 @@ def _worker_init(configs: dict, thresholds: dict, proc_res: tuple):
 
 
 def _extract_roi_strip(gray_proc: np.ndarray) -> np.ndarray:
-    """从处理分辨率灰度图中提取图标区域，拼成一维数组用于帧差比较"""
     a = gray_proc[_ROI_A[1]:_ROI_A[3], _ROI_A[0]:_ROI_A[2]]
     b = gray_proc[_ROI_B[1]:_ROI_B[3], _ROI_B[0]:_ROI_B[2]]
-    # 拼成一维，方便 np.mean(abs(diff))
     return np.concatenate([a.ravel(), b.ravel()])
 
 
-def _worker_classify(frame: np.ndarray) -> int:
+def _worker_classify_gray(gray: np.ndarray) -> int:
     """
-    子进程帧任务：
-    1. resize+灰度（必须）
-    2. 提取图标ROI拼接带（~24µs），与上一帧对比
-    3. ROI均值差 < 1.0 → 直接继承（跳过matchTemplate）
-    4. 否则走完整 _classify_gray
+    子进程帧任务：接收已缩放好的灰度图（不再做 resize+cvtColor）。
+    1. 提取图标 ROI strip，与上一帧对比
+    2. diff < 阈值 → 直接继承，跳过 matchTemplate
+    3. 否则走 _classify_gray
     """
     global _worker_prev_roi, _worker_prev_state
 
-    resized = cv2.resize(frame, _worker_proc_res, interpolation=cv2.INTER_AREA)
-    gray    = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
     roi_strip = _extract_roi_strip(gray)
 
     if _worker_prev_roi is not None:
@@ -262,9 +236,10 @@ def analyze_video(video_path: str, configs: dict, thresholds: dict,
                   progress_cb=None) -> np.ndarray:
     """
     流水线 + 多进程分类每帧。
-    - 独立读帧线程：持续将帧送入队列，消除 IO 等待
-    - ProcessPoolExecutor + initializer：真正多核并行，configs 不重复传输
-    - 子进程帧缓存继承：连续相同帧跳过 matchTemplate
+
+    IO 优化：读帧线程内完成 resize+cvtColor，只向队列放灰度图（~90KB），
+    不放原始 BGR 帧（~6MB）。pickle 体积缩小 60x，大幅降低 IPC 开销。
+
     progress_cb(ratio: float) 在 [0, 1] 之间回调。
     返回 np.ndarray[int8]，每元素为 FRAME_TYPE_*。
     """
@@ -276,11 +251,10 @@ def analyze_video(video_path: str, configs: dict, thresholds: dict,
     states = np.zeros(total, dtype=np.int8)
 
     n_workers = min(n_threads, multiprocessing.cpu_count())
-    # chunksize=16：减少 IPC 次数，实测比 8 快约 30%
-    chunk = max(8, min(32, batch_size // n_workers))
+    chunk     = max(8, min(32, batch_size // n_workers))
+    pw, ph    = proc_res
 
-    # 读帧队列：预读 batch_size 帧，让读帧和计算并行
-    # 队列项：(frame_ndarray, frame_idx) 或 None（结束哨兵）
+    # 读帧队列：(gray_ndarray, frame_idx) 或 None
     read_q: _Queue = _Queue(maxsize=batch_size * 2)
 
     def _reader():
@@ -289,9 +263,13 @@ def analyze_video(video_path: str, configs: dict, thresholds: dict,
             ret, f = cap.read()
             if not ret:
                 break
-            read_q.put((f, idx))
+            # 在读帧线程内完成 resize+cvtColor，只放灰度图进队列
+            gray = cv2.cvtColor(
+                cv2.resize(f, (pw, ph), interpolation=cv2.INTER_AREA),
+                cv2.COLOR_BGR2GRAY)
+            read_q.put((gray, idx))
             idx += 1
-        read_q.put(None)   # 结束哨兵
+        read_q.put(None)
 
     reader_thread = threading.Thread(target=_reader, daemon=True)
     reader_thread.start()
@@ -301,32 +279,33 @@ def analyze_video(video_path: str, configs: dict, thresholds: dict,
             initializer=_worker_init,
             initargs=(configs, thresholds, proc_res)) as ex:
 
-        batch_frames: list = []
+        batch_grays:   list = []
         batch_indices: list = []
         done = False
 
         while not done:
-            # 积攒一批帧
-            while len(batch_frames) < batch_size:
+            while len(batch_grays) < batch_size:
                 item = read_q.get()
                 if item is None:
                     done = True
                     break
-                f, idx = item
-                batch_frames.append(f)
+                gray, idx = item
+                batch_grays.append(gray)
                 batch_indices.append(idx)
 
-            if not batch_frames:
+            if not batch_grays:
                 break
 
-            results = list(ex.map(_worker_classify, batch_frames, chunksize=chunk))
+            # 子进程只收灰度图
+            results = list(ex.map(_worker_classify_gray, batch_grays,
+                                  chunksize=chunk))
             for idx, s in zip(batch_indices, results):
                 states[idx] = s
 
             if progress_cb:
                 progress_cb(batch_indices[-1] / total)
 
-            batch_frames.clear()
+            batch_grays.clear()
             batch_indices.clear()
 
     reader_thread.join(timeout=5)
@@ -350,7 +329,6 @@ def build_segments(states: np.ndarray, video_path: str, proc_res: tuple,
     pauses = []
     speeds = []
 
-    # 用单个 cap 顺序读取所有暂停段的前后帧，避免反复 open/close
     cap = cv2.VideoCapture(video_path)
 
     i = 0
@@ -367,13 +345,9 @@ def build_segments(states: np.ndarray, video_path: str, proc_res: tuple,
             dct_v = h_sim = 0.0
 
             if compare_cfg['enabled']:
-                # 读前帧
-                idx_b = max(0, s_i - 1)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx_b)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, s_i - 1))
                 _, f_b = cap.read()
-                # 读后帧
-                idx_a = min(total - 1, e_i + 1)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx_a)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, min(total - 1, e_i + 1))
                 _, f_a = cap.read()
 
                 if f_b is not None and f_a is not None:
@@ -426,40 +400,27 @@ def build_segments(states: np.ndarray, video_path: str, proc_res: tuple,
 
 def _speedup_mask(states: np.ndarray, frame_type: int, factor: int,
                   exclude_mask: np.ndarray) -> np.ndarray:
-    """
-    对 states == frame_type 的连续段，在段内按 factor 抽帧，
-    返回"应删除"的布尔 mask（numpy 向量化，无 Python for 循环）。
-    exclude_mask：已经标记为删除的帧，跳过不计入连续计数。
-    """
-    total    = len(states)
-    type_mask = (states == frame_type) & ~exclude_mask   # 目标类型且未删除
+    total     = len(states)
+    type_mask = (states == frame_type) & ~exclude_mask
 
     if not type_mask.any():
         return np.zeros(total, dtype=bool)
 
-    # 计算每帧在其所在连续段内的局部序号（1-based）
-    # 方法：cumsum 减去段起点前的 cumsum 值
     cumsum  = np.cumsum(type_mask)
-    # 找每个连续段的起点
     shifted = np.empty(total, dtype=bool)
     shifted[0]  = False
     shifted[1:] = type_mask[:-1]
-    seg_starts = np.where(type_mask & ~shifted)[0]
+    seg_starts  = np.where(type_mask & ~shifted)[0]
 
-    # 在起点处记录 cumsum[start-1]（即上一段结束时的累计值）
     offsets = np.zeros(total, dtype=np.int64)
     for s in seg_starts:
         offsets[s:] = cumsum[s - 1] if s > 0 else 0
 
     local_cnt = np.where(type_mask, cumsum - offsets, 0)
 
-    # factor=2: 删偶数序号（第2,4,6...）; factor=N: 保留第1,留N+1,…删其余
     if factor == 2:
-        del_mask = type_mask & (local_cnt % 2 == 0)
-    else:
-        del_mask = type_mask & (local_cnt % factor != 1)
-
-    return del_mask
+        return type_mask & (local_cnt % 2 == 0)
+    return type_mask & (local_cnt % factor != 1)
 
 
 def build_delete_set(total: int, states: np.ndarray,
@@ -467,31 +428,23 @@ def build_delete_set(total: int, states: np.ndarray,
                      clip_segments: list,
                      speedup_1x: bool, speedup_02: bool,
                      speedup_02_factor: int) -> np.ndarray:
-    """
-    计算需要删除的帧 bool mask（numpy，比 set 快 10-50x）。
-    返回 np.ndarray[bool]，True = 删除。
-    """
+    """计算需要删除的帧 bool mask（numpy，比 set 快 10-50x）"""
     del_mask = np.zeros(total, dtype=bool)
 
-    # 1. 暂停段裁剪区（删中间 [trim_in, trim_out)）
+    # 1. 暂停段裁剪区（删中间）
     for seg in pause_segments:
         if seg['trim_out'] > seg['trim_in']:
             del_mask[seg['trim_in']:seg['trim_out']] = True
 
-    # 2. 手动裁剪段（删两端，保中间 [keep_in, keep_out]）
-    #    keep_in > keep_out 表示全删（用户把两条手柄完全重叠）
+    # 2. 手动裁剪段（删两端，保中间；keep_in > keep_out 时全删）
     for seg in clip_segments:
         s, e = seg['start'], seg['end']
-        ki   = seg['keep_in']
-        ko   = seg['keep_out']
+        ki, ko = seg['keep_in'], seg['keep_out']
         if ki > ko:
-            # 全删
             del_mask[s:e + 1] = True
         else:
-            if ki > s:
-                del_mask[s:ki] = True
-            if ko < e:
-                del_mask[ko + 1:e + 1] = True
+            if ki > s:   del_mask[s:ki] = True
+            if ko < e:   del_mask[ko + 1:e + 1] = True
 
     # 3. 1x 变速抽帧
     if speedup_1x:
@@ -505,13 +458,12 @@ def build_delete_set(total: int, states: np.ndarray,
 
 
 def export_video(video_path: str, output_path: str,
-                 to_del,           # np.ndarray[bool] 或 set[int]
+                 to_del,
                  fps: float, quality: int, progress_cb=None):
     """顺序读取并写入保留帧"""
     cap   = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # 统一转为 bool ndarray 以便 O(1) 索引
     if isinstance(to_del, set):
         mask = np.zeros(total, dtype=bool)
         for idx in to_del:
