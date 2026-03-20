@@ -46,6 +46,7 @@ class VideoPreviewPlayer(tk.Frame):
 
         self.pause_segments: list = []
         self.speed_segments:  list = []
+        self.clip_segments:   list = []   # 手动裁剪段（删两端保中间）
         self.states_array         = None
 
         self.is_playing = False
@@ -70,7 +71,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.timeline = TimelineWidget(self)
         self.timeline.pack(fill=tk.X, padx=10)
         self.timeline.on_seek_cb       = self._on_tl_seek
-        self.timeline.on_white_drag_cb = self._on_tl_drag_end
+        self.timeline.on_handle_end_cb = self._on_tl_drag_end
 
         # 控制栏
         ctrl = ttk.Frame(self)
@@ -94,15 +95,15 @@ class VideoPreviewPlayer(tk.Frame):
         self.btn_analyze.pack(side=tk.LEFT, padx=10)
 
         self.skip_trimmed = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ctrl, text="跳过裁剪区",
+        ttk.Checkbutton(ctrl, text="预览时跳过裁剪区",
                         variable=self.skip_trimmed).pack(side=tk.LEFT, padx=5)
 
         self.lbl_time = ttk.Label(ctrl, text="00:00 / 00:00")
         self.lbl_time.pack(side=tk.RIGHT, padx=10)
 
         # 状态栏
-        self.lbl_info = ttk.Label(self, text="滚轮缩放时间轴，右键拖动，黄色为暂停区域，可拖动选择保留/裁剪区域",
-                                  foreground="#F0B432", font=("Consolas", 10))
+        self.lbl_info = ttk.Label(self, text="就绪",
+                                  foreground="#00CED1", font=("Consolas", 10))
         self.lbl_info.pack(fill=tk.X, padx=10, pady=2)
 
         self._render_loop()
@@ -126,6 +127,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.current_frame_idx = 0
         self.pause_segments.clear()
         self.speed_segments.clear()
+        self.clip_segments.clear()
         self.states_array = None
         self.is_playing   = False
         self.btn_play.config(text="▶ 播放")
@@ -144,6 +146,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.timeline.scroll_offset = 0.0
         self.timeline.pause_segments = self.pause_segments
         self.timeline.speed_segments  = self.speed_segments
+        self.timeline.clip_segments   = self.clip_segments
         self.timeline.current_frame_idx = 0
         self.timeline.mark_dirty()
 
@@ -402,15 +405,65 @@ class VideoPreviewPlayer(tk.Frame):
         from tkinter import messagebox
         self.states_array   = states
         self.pause_segments = pauses
-        self.speed_segments  = speeds
+        self.speed_segments = speeds
+        # 自动生成非暂停区间为 clip_segments
+        self.clip_segments  = self._build_clip_segments(pauses, self.total_frames)
         # 同步到时间轴
         self.timeline.pause_segments = self.pause_segments
         self.timeline.speed_segments  = self.speed_segments
+        self.timeline.clip_segments   = self.clip_segments
         self.timeline.mark_dirty()
         self.btn_analyze.config(state=tk.NORMAL, text="自动模板分析")
         self.timeline.redraw()
         messagebox.showinfo("分析完成",
                             f"识别到 {len(pauses)} 处暂停，{len(speeds)} 个变速区间。")
+
+    @staticmethod
+    def _build_clip_segments(pauses: list, total_frames: int) -> list:
+        """
+        把 [0, total_frames) 里所有不属于任何暂停段的连续区间生成为 clip_segments。
+        初始 keep_in = start, keep_out = end（全保留），用户拖手柄来裁两端。
+        """
+        if total_frames <= 0:
+            return []
+
+        # 收集所有暂停段占用的区间，合并后取补集
+        occupied = []
+        for seg in pauses:
+            occupied.append((seg['start'], seg['end']))
+        occupied.sort()
+
+        clips = []
+        clip_id = 0
+        prev_end = -1   # 上一个占用区间的结束帧
+
+        for ps, pe in occupied:
+            gap_start = prev_end + 1
+            gap_end   = ps - 1
+            if gap_end >= gap_start:
+                clips.append({
+                    'id':       clip_id,
+                    'start':    gap_start,
+                    'end':      gap_end,
+                    'keep_in':  gap_start,
+                    'keep_out': gap_end,
+                })
+                clip_id += 1
+            prev_end = pe
+
+        # 最后一个暂停段之后的尾部
+        tail_start = prev_end + 1
+        tail_end   = total_frames - 1
+        if tail_end >= tail_start:
+            clips.append({
+                'id':       clip_id,
+                'start':    tail_start,
+                'end':      tail_end,
+                'keep_in':  tail_start,
+                'keep_out': tail_end,
+            })
+
+        return clips
 
     # ==========================================================
     #  导出
@@ -434,6 +487,7 @@ class VideoPreviewPlayer(tk.Frame):
             to_del = analyzer.build_delete_set(
                 self.total_frames, states,
                 self.pause_segments, self.speed_segments,
+                self.clip_segments,
                 p['speedup_1x'], p['speedup_02'], p['speedup_02_factor'])
 
             def prog(ratio, written):

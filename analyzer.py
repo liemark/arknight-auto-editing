@@ -464,25 +464,40 @@ def _speedup_mask(states: np.ndarray, frame_type: int, factor: int,
 
 def build_delete_set(total: int, states: np.ndarray,
                      pause_segments: list, speed_segments: list,
+                     clip_segments: list,
                      speedup_1x: bool, speedup_02: bool,
                      speedup_02_factor: int) -> np.ndarray:
     """
     计算需要删除的帧 bool mask（numpy，比 set 快 10-50x）。
     返回 np.ndarray[bool]，True = 删除。
-    调用方可用 np.where(mask)[0] 转为下标集合，或直接用布尔索引。
     """
     del_mask = np.zeros(total, dtype=bool)
 
-    # 1. 暂停段裁剪区
+    # 1. 暂停段裁剪区（删中间 [trim_in, trim_out)）
     for seg in pause_segments:
         if seg['trim_out'] > seg['trim_in']:
             del_mask[seg['trim_in']:seg['trim_out']] = True
 
-    # 2. 1x 变速抽帧（每段内隔帧删）
+    # 2. 手动裁剪段（删两端，保中间 [keep_in, keep_out]）
+    #    keep_in > keep_out 表示全删（用户把两条手柄完全重叠）
+    for seg in clip_segments:
+        s, e = seg['start'], seg['end']
+        ki   = seg['keep_in']
+        ko   = seg['keep_out']
+        if ki > ko:
+            # 全删
+            del_mask[s:e + 1] = True
+        else:
+            if ki > s:
+                del_mask[s:ki] = True
+            if ko < e:
+                del_mask[ko + 1:e + 1] = True
+
+    # 3. 1x 变速抽帧
     if speedup_1x:
         del_mask |= _speedup_mask(states, FRAME_TYPE_1X, 2, del_mask)
 
-    # 3. 0.2x 变速抽帧
+    # 4. 0.2x 变速抽帧
     if speedup_02 and speedup_02_factor > 1:
         del_mask |= _speedup_mask(states, FRAME_TYPE_0_2X, speedup_02_factor, del_mask)
 
