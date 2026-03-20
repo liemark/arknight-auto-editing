@@ -7,6 +7,7 @@
 默认参数已经有一定的剪辑效果  
 还提供了时间轴用于暂停事件的精细化调整与视频预览  
 目前是纯python版本，瓶颈在H.264解码
+""
 cap.read
   视频解码 (BGR 原始尺寸)                                3.62 ms/帧  (276 fps)  
 Resize + ColorConvert  
@@ -19,3 +20,4 @@ _classify_gray
   Pickle 原始帧 (2560x1440): 2.130 ms
 端到端速度
   4.25 ms/帧  (235 fps)
+""
