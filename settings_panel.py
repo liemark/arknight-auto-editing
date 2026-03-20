@@ -112,22 +112,48 @@ class SettingsPanel(ttk.LabelFrame):
         ttk.Spinbox(tab_pause, from_=0, to=300,
                     textvariable=self.keep_after_var, width=6).grid(
             row=r, column=1, sticky=tk.W, padx=4)
+        r += 1
+
+        ttk.Separator(tab_pause, orient=tk.HORIZONTAL).grid(
+            row=r, column=0, columnspan=2, sticky=tk.EW, pady=6)
+        r += 1
+
+        ttk.Label(tab_pause, text="批量应用到所有暂停:").grid(
+            row=r, column=0, columnspan=2, sticky=tk.W, pady=(2, 4))
+        r += 1
+
+        btn_frame = ttk.Frame(tab_pause)
+        btn_frame.grid(row=r, column=0, columnspan=2, sticky=tk.EW)
+        # 三个按钮竖排
+        self.apply_pause_btn_keep = ttk.Button(
+            btn_frame, text="全部保留",
+            command=lambda: self._on_apply_pause('keep'))
+        self.apply_pause_btn_keep.pack(fill=tk.X, pady=2)
+        self.apply_pause_btn_auto = ttk.Button(
+            btn_frame, text="按设置裁剪",
+            command=lambda: self._on_apply_pause('auto'))
+        self.apply_pause_btn_auto.pack(fill=tk.X, pady=2)
+        self.apply_pause_btn_all = ttk.Button(
+            btn_frame, text="全部裁剪",
+            command=lambda: self._on_apply_pause('all'))
+        self.apply_pause_btn_all.pack(fill=tk.X, pady=2)
 
         # ---- 导出 ----
         r = 0
-        tab_export.columnconfigure(1, weight=1)
+        tab_export.columnconfigure(0, weight=0)
+        tab_export.columnconfigure(1, weight=1)   # Entry 拉伸
         self.output_var = tk.StringVar()
         ttk.Label(tab_export, text="输出路径:").grid(row=r, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(tab_export, textvariable=self.output_var, width=28).grid(
+        ttk.Entry(tab_export, textvariable=self.output_var).grid(
             row=r, column=1, sticky=tk.EW, padx=4)
         ttk.Button(tab_export, text="浏览",
-                   command=self._browse_output).grid(row=r, column=2)
+                   command=self._browse_output, width=5).grid(row=r, column=2)
         r += 1
 
         self.quality_var = tk.IntVar(value=6)
         ttk.Label(tab_export, text="视频质量 (0-10):").grid(row=r, column=0, sticky=tk.W, pady=2)
         ttk.Spinbox(tab_export, from_=0, to=10,
-                    textvariable=self.quality_var, width=6).grid(
+                    textvariable=self.quality_var, width=4).grid(
             row=r, column=1, sticky=tk.W, padx=4)
         r += 1
 
@@ -157,6 +183,11 @@ class SettingsPanel(ttk.LabelFrame):
     def _on_export(self):
         if self.export_callback:
             self.export_callback()
+
+    def _on_apply_pause(self, mode: str):
+        """触发播放器的批量暂停模式应用"""
+        if hasattr(self, 'apply_pause_callback') and self.apply_pause_callback:
+            self.apply_pause_callback(mode)
 
     def get_params(self) -> dict:
         """一次性读取所有参数，返回纯 Python 字典（无 tkinter 依赖）"""
