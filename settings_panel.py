@@ -63,6 +63,16 @@ class SettingsPanel(ttk.LabelFrame):
                     textvariable=self.speedup_02x_factor_var, width=7).grid(
             row=sep_r+3, column=1, sticky=tk.W, padx=4)
 
+        ttk.Separator(tab_basic, orient=tk.HORIZONTAL).grid(
+            row=sep_r+4, column=0, columnspan=2, sticky=tk.EW, pady=4)
+
+        self.key_repeat_speed_var = tk.IntVar(value=30)
+        ttk.Label(tab_basic, text="←→ 连续移动速度\n(帧/秒):").grid(
+            row=sep_r+5, column=0, sticky=tk.W, pady=2)
+        ttk.Spinbox(tab_basic, from_=1, to=120,
+                    textvariable=self.key_repeat_speed_var, width=7).grid(
+            row=sep_r+5, column=1, sticky=tk.W, padx=4)
+
         # ---- 匹配阈值 ----
         self.thr_pause_var = tk.DoubleVar(value=0.7)
         self.thr_1x_var    = tk.DoubleVar(value=0.7)
@@ -147,13 +157,13 @@ class SettingsPanel(ttk.LabelFrame):
         ttk.Entry(tab_export, textvariable=self.output_var).grid(
             row=r, column=1, sticky=tk.EW, padx=4)
         ttk.Button(tab_export, text="浏览",
-                   command=self._browse_output, width=5).grid(row=r, column=2)
+                   command=self._browse_output).grid(row=r, column=2)
         r += 1
 
         self.quality_var = tk.IntVar(value=6)
         ttk.Label(tab_export, text="视频质量 (0-10):").grid(row=r, column=0, sticky=tk.W, pady=2)
         ttk.Spinbox(tab_export, from_=0, to=10,
-                    textvariable=self.quality_var, width=4).grid(
+                    textvariable=self.quality_var, width=8).grid(
             row=r, column=1, sticky=tk.W, padx=4)
         r += 1
 
@@ -198,6 +208,7 @@ class SettingsPanel(ttk.LabelFrame):
             'speedup_1x':  self.speedup_1x_var.get(),
             'speedup_02':  self.speedup_02x_var.get(),
             'speedup_02_factor': self.speedup_02x_factor_var.get(),
+            'key_repeat_speed':  self.key_repeat_speed_var.get(),
             'thresholds': {
                 'pause':      self.thr_pause_var.get(),
                 'speed_1x':   self.thr_1x_var.get(),

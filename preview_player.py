@@ -54,6 +54,14 @@ class VideoPreviewPlayer(tk.Frame):
         self._frame_q: Queue = Queue(maxsize=2)
         self._canvas_img_id = None
 
+        # 键盘连续移动状态
+        self._key_held:       str | None = None   # 'Left' or 'Right'
+        self._key_after_id:   str | None = None   # after() 句柄（移动循环）
+        self._key_hold_fired: bool       = False  # 是否已进入连续移动阶段
+        self._key_preview_id: str | None = None   # after() 句柄（预览刷新）
+        # 连续移动预览刷新间隔（ms）：每隔此时间发一次 seek 显示画面
+        _KEY_PREVIEW_MS = 150
+
         self._setup_ui()
         if video_path:
             self.load_video(video_path)
@@ -106,7 +114,17 @@ class VideoPreviewPlayer(tk.Frame):
                                   foreground="#00CED1", font=("Consolas", 10))
         self.lbl_info.pack(fill=tk.X, padx=10, pady=2)
 
+        # 操作提示
+        hint = ("← → 逐帧/连续移动  |  空格 播放/暂停  |  "
+                "连续移动速度可在「基本」设置里调整")
+        ttk.Label(self, text=hint, foreground="#555555",
+                  font=("Consolas", 8)).pack(fill=tk.X, padx=10, pady=(0, 2))
+
         self._render_loop()
+
+        # 键盘事件绑定到顶层窗口（避免焦点问题）
+        # 使用 after_idle 等 UI 完全初始化后再绑定
+        self.after_idle(self._bind_keys)
 
     # ==========================================================
     #  视频加载
@@ -246,6 +264,127 @@ class VideoPreviewPlayer(tk.Frame):
     def _send_stop(self):
         if self._io:
             self._io.send({'type': CMD_STOP})
+
+    # ==========================================================
+    #  键盘快捷键
+    # ==========================================================
+
+    # 连续移动期间的预览刷新间隔（ms）
+    _KEY_PREVIEW_MS = 150
+
+    def _bind_keys(self):
+        root = self.winfo_toplevel()
+        root.bind('<Left>',              self._on_key_press_left,  add='+')
+        root.bind('<Right>',             self._on_key_press_right, add='+')
+        root.bind('<KeyRelease-Left>',   self._on_key_release,     add='+')
+        root.bind('<KeyRelease-Right>',  self._on_key_release,     add='+')
+        root.bind('<space>',             self._on_key_space,       add='+')
+
+    def _on_key_press_left(self, event):
+        if self._key_held == 'Left':
+            return
+        self._key_held       = 'Left'
+        self._key_hold_fired = False
+        self._step_frame(-1, seek=True)   # 单步：立即 seek 显示画面
+        self._key_after_id = self.after(400, self._start_repeat, 'Left')
+
+    def _on_key_press_right(self, event):
+        if self._key_held == 'Right':
+            return
+        self._key_held       = 'Right'
+        self._key_hold_fired = False
+        self._step_frame(+1, seek=True)
+        self._key_after_id = self.after(400, self._start_repeat, 'Right')
+
+    def _on_key_release(self, event):
+        direction = event.keysym
+        if self._key_held != direction:
+            return
+        self._key_held = None
+        # 取消移动循环
+        if self._key_after_id:
+            self.after_cancel(self._key_after_id)
+            self._key_after_id = None
+        # 取消预览循环
+        if self._key_preview_id:
+            self.after_cancel(self._key_preview_id)
+            self._key_preview_id = None
+        # 松手时补发一次 seek，确保画面停在最终位置
+        if self._key_hold_fired:
+            self._do_preview_seek()
+
+    def _on_key_space(self, event):
+        focused = self.focus_get()
+        if isinstance(focused, (ttk.Entry, ttk.Spinbox, tk.Entry)):
+            return
+        self.toggle_play()
+
+    def _start_repeat(self, direction: str):
+        """长按 400ms 后进入连续移动阶段，同时启动预览刷新定时器"""
+        self._key_hold_fired = True
+        # 启动预览刷新循环（独立于移动循环，固定 150ms 一次）
+        self._schedule_preview()
+        self._repeat_frame(direction)
+
+    def _repeat_frame(self, direction: str):
+        """
+        连续移动循环：只更新 current_frame_idx 和时间轴红条，
+        不发 seek（避免每帧解码，IO 线程压力大且画面闪烁）。
+        画面刷新由独立的 _preview_tick 定时器负责。
+        """
+        if self._key_held != direction:
+            return
+        delta = -1 if direction == 'Left' else +1
+        self._step_frame(delta, seek=False)   # 只动指针，不 seek
+        speed    = self.settings.key_repeat_speed_var.get()
+        interval = max(16, int(1000 / speed))
+        self._key_after_id = self.after(interval, self._repeat_frame, direction)
+
+    def _schedule_preview(self):
+        """启动预览刷新定时器"""
+        self._key_preview_id = self.after(
+            self._KEY_PREVIEW_MS, self._preview_tick)
+
+    def _preview_tick(self):
+        """定期发一次 seek 显示当前位置的画面"""
+        if not self._key_held:
+            return
+        self._do_preview_seek()
+        self._key_preview_id = self.after(
+            self._KEY_PREVIEW_MS, self._preview_tick)
+
+    def _do_preview_seek(self):
+        """向 IO 线程发送节流 seek，显示当前帧画面"""
+        if not self._io or self.total_frames <= 0:
+            return
+        idx = self.current_frame_idx
+        self._io.send({
+            'type':         CMD_SEEK_LATEST,
+            'frame':        idx,
+            'canvas_wh':    self._canvas_wh(),
+            'pause_segs':   [],        # 连续移动时不跳裁剪区，显示原始画面
+            'skip_trimmed': False,
+        })
+
+    def _step_frame(self, delta: int, seek: bool = True):
+        """
+        移动若干帧。
+        seek=True：同时发 CMD_SEEK_LATEST 刷新画面（单步用）
+        seek=False：只更新索引和时间轴红条（连续移动用，画面由预览定时器刷新）
+        """
+        if self.total_frames <= 0:
+            return
+        new_idx = max(0, min(self.total_frames - 1,
+                             self.current_frame_idx + delta))
+        if new_idx == self.current_frame_idx:
+            return
+        self.current_frame_idx = new_idx
+        self.timeline.current_frame_idx = new_idx
+        self.timeline._ensure_pointer_visible()
+        self.timeline.update_pointer()
+        self._update_labels()
+        if seek:
+            self._seek(new_idx, skip_trim=False)
 
     # ==========================================================
     #  播放控制
