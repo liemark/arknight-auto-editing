@@ -26,9 +26,9 @@ class VideoPreviewPlayer(tk.Frame):
       ├─────────────────────┤
       │   TimelineWidget    │  ← 时间轴（独立组件）
       ├─────────────────────┤
-      │   控制栏            │
+      │   控制栏             │
       ├─────────────────────┤
-      │   状态栏            │
+      │   状态栏             │
       └─────────────────────┘
     """
 
@@ -55,12 +55,12 @@ class VideoPreviewPlayer(tk.Frame):
         self._canvas_img_id = None
 
         # 键盘连续移动状态
-        self._key_held:       str | None = None   # 'Left' or 'Right'
-        self._key_after_id:   str | None = None   # after() 句柄（移动循环）
-        self._key_hold_fired: bool       = False  # 是否已进入连续移动阶段
-        self._key_preview_id: str | None = None   # after() 句柄（预览刷新）
-        # 连续移动预览刷新间隔（ms）：每隔此时间发一次 seek 显示画面
-        _KEY_PREVIEW_MS = 150
+        self._key_held:       str | None = None
+        self._key_after_id:   str | None = None
+        self._key_hold_fired: bool       = False
+        self._key_preview_id: str | None = None
+        # 鼠标拖动红条状态：拖动期间不让旧帧覆盖 current_frame_idx
+        self._is_dragging:    bool       = False
 
         self._setup_ui()
         if video_path:
@@ -318,9 +318,16 @@ class VideoPreviewPlayer(tk.Frame):
         if self._key_preview_id:
             self.after_cancel(self._key_preview_id)
             self._key_preview_id = None
-        # 松手时补发一次 seek，确保画面停在最终位置
         if self._key_hold_fired:
-            self._do_preview_seek()
+            # flush 掉 frame_q 里旧帧（_preview_tick 积压的），
+            # 避免松手后旧帧覆盖 current_frame_idx 导致位置错误
+            while True:
+                try:
+                    self._frame_q.get_nowait()
+                except Empty:
+                    break
+            self._do_preview_seek()   # 补发最终位置的 seek
+        self._key_hold_fired = False  # 重置后 _render_loop 恢复正常更新
 
     def _on_key_space(self, event):
         # 焦点在输入类控件时放行（用户在打字/输入数字），其余情况空格=播放/暂停
@@ -415,10 +422,18 @@ class VideoPreviewPlayer(tk.Frame):
     # ==========================================================
     def _on_tl_seek(self, frame_idx: int):
         """时间轴点击/拖动红条 → seek（不跳过裁剪区）"""
+        self._is_dragging = True
         self._seek(frame_idx, skip_trim=False)
 
     def _on_tl_drag_end(self):
-        """红条松手：若正在播放则从当前位置重启"""
+        """红条松手：flush 旧帧，确保 current_frame_idx 不被旧帧覆盖"""
+        self._is_dragging = False
+        # 清空队列里可能残留的旧帧，避免覆盖刚设好的位置
+        while True:
+            try:
+                self._frame_q.get_nowait()
+            except Empty:
+                break
         if self.is_playing:
             self._send_play(self.current_frame_idx)
 
@@ -428,10 +443,10 @@ class VideoPreviewPlayer(tk.Frame):
     def _render_loop(self):
         try:
             idx, rgb = self._frame_q.get_nowait()
-            # 连续移动期间：帧的 idx 可能是 150ms 前发 seek 时的旧位置，
-            # 不能覆盖已经快速推进的 current_frame_idx（否则红条回弹）。
-            # 只在非键盘连续移动时才用帧 idx 更新当前位置。
-            if not self._key_hold_fired:
+            # 以下两种情况不用帧 idx 覆盖 current_frame_idx：
+            # 1. 键盘连续移动中：帧是 150ms 前发的旧位置
+            # 2. 鼠标拖动中：快速来回拖动会积压旧帧，不能让旧帧回弹位置
+            if not self._key_hold_fired and not self._is_dragging:
                 self.current_frame_idx = idx
                 self.timeline.current_frame_idx = idx
                 self.timeline._ensure_pointer_visible()
