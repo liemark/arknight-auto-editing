@@ -74,11 +74,20 @@ class VideoIOThread(threading.Thread):
 
     @staticmethod
     def jump_pause(cur: int, pause_segs: list) -> int:
-        """若 cur 在裁剪区 [ti, to) 内，返回 to；否则返回 cur"""
-        for ti, to in pause_segs:
-            if to > ti and ti <= cur < to:
-                return to
-        return cur
+        """
+        循环跳过所有删除区，直到落点不在任何区间内。
+        处理相邻/连续删除区（如暂停→普通→暂停紧挨着）：
+        单次跳完第一个区间后落点可能仍在第二个区间，继续跳直到稳定。
+        """
+        while True:
+            jumped = cur
+            for ti, to in pause_segs:
+                if to > ti and ti <= cur < to:
+                    jumped = to
+                    break
+            if jumped == cur:
+                return cur
+            cur = jumped
 
     @staticmethod
     def speed_step(cur: int, speed_segs: list,
