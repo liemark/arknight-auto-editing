@@ -8,7 +8,7 @@
 还提供了时间轴用于暂停事件的精细化调整与视频预览  
 目前是纯python版本，瓶颈在H.264解码
 ```
-链接: https://pan.baidu.com/s/18YSZRhW4sWG3ucwXSDE-0g?pwd=2333  
+链接: https://pan.baidu.com/s/1RsfBPrrw0mAruAia6wIEMw?pwd=2333
 提取码: 2333
 ```
 ```
