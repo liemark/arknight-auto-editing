@@ -74,6 +74,9 @@ class VideoPreviewPlayer(tk.Frame):
         self.video_canvas = tk.Canvas(self, width=self.canvas_w,
                                       height=self.canvas_h, bg="black")
         self.video_canvas.pack(pady=5, fill=tk.BOTH, expand=True)
+        # 点击画布时抢回焦点，避免空格误触其他控件
+        self.video_canvas.bind("<Button-1>",
+                               lambda e: self.video_canvas.focus_set())
 
         # 时间轴组件
         self.timeline = TimelineWidget(self)
@@ -279,6 +282,29 @@ class VideoPreviewPlayer(tk.Frame):
         root.bind('<KeyRelease-Left>',   self._on_key_release,     add='+')
         root.bind('<KeyRelease-Right>',  self._on_key_release,     add='+')
         root.bind('<space>',             self._on_key_space,       add='+')
+        # 覆盖会响应空格的控件 class binding，阻止误触
+        for cls in ('TButton', 'Button', 'TCheckbutton', 'TRadiobutton',
+                    'TCombobox', 'TNotebook'):
+            root.bind_class(cls, '<space>', lambda e: 'break')
+        # 启动后把焦点给画布，之后任何控件获得焦点时都延迟夺回
+        self.after_idle(self._reclaim_focus)
+        root.bind('<FocusIn>', self._on_focus_in, add='+')
+
+    def _on_focus_in(self, event):
+        """任何控件获得焦点时，若不是输入类控件则延迟把焦点还给画布"""
+        # 输入类控件（用户需要打字）不抢焦点
+        if isinstance(event.widget, (ttk.Entry, ttk.Spinbox, tk.Entry,
+                                     ttk.Combobox)):
+            return
+        # 延迟执行，让控件先完成自己的点击响应，再把焦点移走
+        self.after(1, self._reclaim_focus)
+
+    def _reclaim_focus(self):
+        """把焦点还给视频画布"""
+        try:
+            self.video_canvas.focus_set()
+        except Exception:
+            pass
 
     def _on_key_press_left(self, event):
         if self._key_held == 'Left':
@@ -314,10 +340,8 @@ class VideoPreviewPlayer(tk.Frame):
             self._do_preview_seek()
 
     def _on_key_space(self, event):
-        focused = self.focus_get()
-        if isinstance(focused, (ttk.Entry, ttk.Spinbox, tk.Entry)):
-            return
         self.toggle_play()
+        return 'break'   # 阻断事件继续传播，防止按钮等控件响应空格
 
     def _start_repeat(self, direction: str):
         """长按 400ms 后进入连续移动阶段，同时启动预览刷新定时器"""
@@ -417,10 +441,14 @@ class VideoPreviewPlayer(tk.Frame):
     def _render_loop(self):
         try:
             idx, rgb = self._frame_q.get_nowait()
-            self.current_frame_idx = idx
-            self.timeline.current_frame_idx = idx
+            # 连续移动期间：帧的 idx 可能是 150ms 前发 seek 时的旧位置，
+            # 不能覆盖已经快速推进的 current_frame_idx（否则红条回弹）。
+            # 只在非键盘连续移动时才用帧 idx 更新当前位置。
+            if not self._key_hold_fired:
+                self.current_frame_idx = idx
+                self.timeline.current_frame_idx = idx
+                self.timeline._ensure_pointer_visible()
             self._display_rgb(rgb)
-            self.timeline._ensure_pointer_visible()
         except Empty:
             pass
         self.timeline.update_pointer()
