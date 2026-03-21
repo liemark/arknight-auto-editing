@@ -26,9 +26,9 @@ class VideoPreviewPlayer(tk.Frame):
       ├─────────────────────┤
       │   TimelineWidget    │  ← 时间轴（独立组件）
       ├─────────────────────┤
-      │   控制栏             │
+      │   控制栏            │
       ├─────────────────────┤
-      │   状态栏             │
+      │   状态栏            │
       └─────────────────────┘
     """
 
@@ -74,7 +74,6 @@ class VideoPreviewPlayer(tk.Frame):
         self.video_canvas = tk.Canvas(self, width=self.canvas_w,
                                       height=self.canvas_h, bg="black")
         self.video_canvas.pack(pady=5, fill=tk.BOTH, expand=True)
-        # 点击画布时抢回焦点，避免空格误触其他控件
         self.video_canvas.bind("<Button-1>",
                                lambda e: self.video_canvas.focus_set())
 
@@ -83,6 +82,9 @@ class VideoPreviewPlayer(tk.Frame):
         self.timeline.pack(fill=tk.X, padx=10)
         self.timeline.on_seek_cb       = self._on_tl_seek
         self.timeline.on_handle_end_cb = self._on_tl_drag_end
+        # 点击时间轴时把焦点移离输入控件
+        self.timeline.canvas.bind("<Button-1>",
+            lambda e: self.video_canvas.focus_set(), add='+')
 
         # 控制栏
         ctrl = ttk.Frame(self)
@@ -281,30 +283,11 @@ class VideoPreviewPlayer(tk.Frame):
         root.bind('<Right>',             self._on_key_press_right, add='+')
         root.bind('<KeyRelease-Left>',   self._on_key_release,     add='+')
         root.bind('<KeyRelease-Right>',  self._on_key_release,     add='+')
-        root.bind('<space>',             self._on_key_space,       add='+')
-        # 覆盖会响应空格的控件 class binding，阻止误触
+        # 空格统一由我们处理，阻止按钮等控件自己响应
+        root.bind('<space>', self._on_key_space)
         for cls in ('TButton', 'Button', 'TCheckbutton', 'TRadiobutton',
                     'TCombobox', 'TNotebook'):
             root.bind_class(cls, '<space>', lambda e: 'break')
-        # 启动后把焦点给画布，之后任何控件获得焦点时都延迟夺回
-        self.after_idle(self._reclaim_focus)
-        root.bind('<FocusIn>', self._on_focus_in, add='+')
-
-    def _on_focus_in(self, event):
-        """任何控件获得焦点时，若不是输入类控件则延迟把焦点还给画布"""
-        # 输入类控件（用户需要打字）不抢焦点
-        if isinstance(event.widget, (ttk.Entry, ttk.Spinbox, tk.Entry,
-                                     ttk.Combobox)):
-            return
-        # 延迟执行，让控件先完成自己的点击响应，再把焦点移走
-        self.after(1, self._reclaim_focus)
-
-    def _reclaim_focus(self):
-        """把焦点还给视频画布"""
-        try:
-            self.video_canvas.focus_set()
-        except Exception:
-            pass
 
     def _on_key_press_left(self, event):
         if self._key_held == 'Left':
@@ -340,8 +323,12 @@ class VideoPreviewPlayer(tk.Frame):
             self._do_preview_seek()
 
     def _on_key_space(self, event):
+        # 焦点在输入类控件时放行（用户在打字/输入数字），其余情况空格=播放/暂停
+        focused = self.focus_get()
+        if isinstance(focused, (ttk.Entry, ttk.Spinbox, tk.Entry, ttk.Combobox)):
+            return
         self.toggle_play()
-        return 'break'   # 阻断事件继续传播，防止按钮等控件响应空格
+        return 'break'
 
     def _start_repeat(self, direction: str):
         """长按 400ms 后进入连续移动阶段，同时启动预览刷新定时器"""

@@ -329,6 +329,8 @@ class TimelineWidget(tk.Frame):
         self._draw_dynamic()
 
     def _on_mousedown(self, event):
+        # 点击时间轴抢回焦点，使空格能正常触发播放/暂停
+        self.canvas.focus_set()
         if self.total_frames <= 0: return
         w = self.canvas.winfo_width()
         ey = event.y
