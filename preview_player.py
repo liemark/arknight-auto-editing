@@ -172,6 +172,29 @@ class VideoPreviewPlayer(tk.Frame):
     def _speed_segs_snap(self) -> list:
         return [(s['start'], s['end'], s['type']) for s in self.speed_segments]
 
+    def _all_skip_segs_snap(self) -> list:
+        """
+        合并所有需要预览跳过的区间：
+          - pause 段的裁剪区 [trim_in, trim_out)
+          - clip  段的两端删除区 [start, keep_in) 和 (keep_out, end]
+        IO 线程的 jump_pause 对两种区间的处理完全一样。
+        """
+        segs = []
+        for s in self.pause_segments:
+            if s['trim_out'] > s['trim_in']:
+                segs.append((s['trim_in'], s['trim_out']))
+        for s in self.clip_segments:
+            ki, ko = s['keep_in'], s['keep_out']
+            if ki > ko:
+                # 全删
+                segs.append((s['start'], s['end'] + 1))
+            else:
+                if ki > s['start']:
+                    segs.append((s['start'], ki))
+                if ko < s['end']:
+                    segs.append((ko + 1, s['end'] + 1))
+        return segs
+
     def _seek(self, frame_idx: int, skip_trim: bool = False):
         """发送节流 seek 命令（不影响播放状态）"""
         if not self._io:
@@ -182,7 +205,7 @@ class VideoPreviewPlayer(tk.Frame):
             'type':         CMD_SEEK_LATEST,
             'frame':        frame_idx,
             'canvas_wh':    self._canvas_wh(),
-            'pause_segs':   self._pause_segs_snap(),
+            'pause_segs':   self._all_skip_segs_snap(),
             'skip_trimmed': skip_trim,
         })
 
@@ -214,7 +237,7 @@ class VideoPreviewPlayer(tk.Frame):
                 'speedup_1x':        p['speedup_1x'],
                 'speedup_02':        p['speedup_02'],
                 'speedup_02_factor': p['speedup_02_factor'],
-                'pause_segs':        self._pause_segs_snap(),
+                'pause_segs':        self._all_skip_segs_snap(),
                 'speed_segs':        self._speed_segs_snap(),
                 'canvas_wh':         self._canvas_wh(),
             }
