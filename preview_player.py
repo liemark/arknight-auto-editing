@@ -10,9 +10,13 @@ import numpy as np
 import PIL.Image
 import PIL.ImageTk
 import threading
+import subprocess
+import shutil
+import os
 from queue import Queue, Empty
 
-from frame_types import FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X
+from frame_types import (FRAME_TYPE_NORMAL, FRAME_TYPE_PAUSE,
+                         FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X)
 from video_io import VideoIOThread, CMD_SEEK, CMD_SEEK_LATEST, CMD_PLAY, CMD_STOP
 from timeline_widget import TimelineWidget
 
@@ -699,5 +703,131 @@ class VideoPreviewPlayer(tk.Frame):
                 self.after(0, lambda: messagebox.showerror("导出失败", str(e)))
             finally:
                 self.after(0, lambda: self.settings.export_btn.config(state=tk.NORMAL))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+    # ==========================================================
+    #  分段导出（仅导出时间轴有效区域，不应用基础参数变速）
+    # ==========================================================
+    @staticmethod
+    def _speed_label(state: int) -> str:
+        return {
+            FRAME_TYPE_2X: '2x',
+            FRAME_TYPE_1X: '1x',
+            FRAME_TYPE_0_2X: '0.2x',
+            FRAME_TYPE_NORMAL: 'other',
+        }.get(state, 'other')
+
+    def _build_valid_segments_for_export(self, states: np.ndarray, split_by_speed: bool) -> list:
+        import analyzer
+
+        to_del = analyzer.build_delete_set(
+            self.total_frames, states,
+            self.pause_segments, self.speed_segments, self.clip_segments,
+            speedup_1x=False, speedup_02=False, speedup_02_factor=1)
+        valid = ~to_del
+
+        segs = []
+        i = 0
+        while i < self.total_frames:
+            if not valid[i]:
+                i += 1
+                continue
+
+            cur_state = int(states[i])
+            is_pause = (cur_state == FRAME_TYPE_PAUSE)
+            speed_label = self._speed_label(cur_state)
+            s = i
+            i += 1
+            while i < self.total_frames and valid[i]:
+                st = int(states[i])
+                if is_pause:
+                    if st != FRAME_TYPE_PAUSE:
+                        break
+                else:
+                    if st == FRAME_TYPE_PAUSE:
+                        break
+                    if split_by_speed and self._speed_label(st) != speed_label:
+                        break
+                i += 1
+            e = i - 1
+
+            if is_pause:
+                label = 'pause'
+            elif split_by_speed:
+                label = speed_label
+            else:
+                label = 'normal'
+
+            segs.append({
+                'start': s,
+                'end': e,
+                'label': label,
+            })
+        return segs
+
+    def export_segments(self):
+        from tkinter import messagebox
+        import analyzer
+
+        if not self.video_path:
+            messagebox.showerror("错误", "请先加载视频")
+            return
+
+        p = self.settings.get_params()
+        out_path = p.get('output') or ""
+        if not out_path:
+            messagebox.showerror("错误", "请先设置导出路径（用于确定分段输出目录）")
+            return
+
+        out_root = os.path.dirname(out_path) or os.getcwd()
+        base = os.path.splitext(os.path.basename(out_path))[0] or "segments"
+        out_dir = os.path.join(out_root, f"{base}_segments")
+        os.makedirs(out_dir, exist_ok=True)
+
+        states = self.states_array
+        if states is None:
+            states = np.zeros(self.total_frames, dtype=np.int8)
+
+        split = self.settings.segment_split_by_speed_var.get()
+        segs = self._build_valid_segments_for_export(states, split)
+        if not segs:
+            messagebox.showwarning("提示", "当前时间轴没有可导出的有效片段。")
+            return
+
+        self.settings.segment_export_btn.config(state=tk.DISABLED)
+
+        def worker():
+            total = len(segs)
+            pad = max(3, len(str(total)))
+            exported = 0
+
+            for idx, seg in enumerate(segs, start=1):
+                stem = f"{idx:0{pad}d}_{seg['label']}"
+                final_path = os.path.join(out_dir, f"{stem}.mp4")
+                try:
+                    analyzer.export_frame_range(
+                        self.video_path, final_path,
+                        seg['start'], seg['end'],
+                        self.fps, p['quality'])
+                    exported += 1
+                except Exception:
+                    if os.path.exists(final_path):
+                        os.remove(final_path)
+
+                ratio = idx / total
+                self.after(0, lambda r=ratio, i=idx, t=total: (
+                    self.settings.segment_export_progress_var.set(r * 100),
+                    self.settings.segment_export_status_var.set(
+                        f"导出分段 {i}/{t}")))
+
+            self.after(0, lambda: self.settings.segment_export_status_var.set(
+                f"完成：{exported}/{total} 段（分段导出默认不保留音频）"))
+            self.after(0, lambda: messagebox.showinfo(
+                "分段导出完成",
+                f"输出目录：{out_dir}\n完成：{exported}/{total} 段\n"
+                "说明：分段导出默认不保留音频，以避免音画错位/拖尾问题。"))
+            self.after(0, lambda: self.settings.segment_export_btn.config(state=tk.NORMAL))
 
         threading.Thread(target=worker, daemon=True).start()

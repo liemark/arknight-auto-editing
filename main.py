@@ -33,9 +33,9 @@ def main():
     left_frame = ttk.Frame(paned)
     paned.add(left_frame, stretch="always", minsize=500)
 
-    # 右：设置面板（默认宽度 330，可拖到更宽）
+    # 右：设置面板（默认宽度 360，可拖到更宽）
     right_frame = ttk.Frame(paned)
-    paned.add(right_frame, stretch="never", minsize=240, width=330)
+    paned.add(right_frame, stretch="never", minsize=240, width=360)
 
     settings = SettingsPanel(right_frame)
     settings.pack(fill=tk.BOTH, expand=True)
@@ -45,6 +45,7 @@ def main():
 
     # 绑定导出
     settings.export_callback = player.export_video
+    settings.segment_export_callback = player.export_segments
     # 绑定批量暂停模式按钮
     settings.apply_pause_callback = player.apply_pause_mode
 

@@ -456,3 +456,56 @@ def export_video(video_path: str, output_path: str,
     writer.close() if use_imageio else writer.release()
     cap.release()
     return written, total
+
+
+def export_frame_range(video_path: str, output_path: str,
+                       start_frame: int, end_frame: int,
+                       fps: float, quality: int, progress_cb=None):
+    """导出闭区间 [start_frame, end_frame] 的视频（不含音频）"""
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total <= 0:
+        cap.release()
+        raise RuntimeError("无法读取视频帧")
+
+    s = max(0, min(start_frame, total - 1))
+    e = max(0, min(end_frame, total - 1))
+    if e < s:
+        cap.release()
+        raise RuntimeError("分段范围无效")
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, s)
+
+    try:
+        import imageio
+        writer = imageio.get_writer(output_path, fps=fps, codec='libx264',
+                                    quality=quality, pixelformat='yuv420p')
+        use_imageio = True
+    except ImportError:
+        use_imageio = False
+        ret, sample = cap.read()
+        cap.set(cv2.CAP_PROP_POS_FRAMES, s)
+        if not ret:
+            cap.release()
+            raise RuntimeError("无法读取视频帧")
+        h, w = sample.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
+    seg_len = e - s + 1
+    written = 0
+    for i in range(seg_len):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if use_imageio:
+            writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        else:
+            writer.write(frame)
+        written += 1
+        if progress_cb and i % 30 == 0:
+            progress_cb((i + 1) / seg_len, written)
+
+    writer.close() if use_imageio else writer.release()
+    cap.release()
+    return written, seg_len

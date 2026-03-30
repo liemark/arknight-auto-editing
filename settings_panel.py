@@ -11,6 +11,7 @@ class SettingsPanel(ttk.LabelFrame):
     def __init__(self, parent, **kw):
         super().__init__(parent, text="处理参数", padding=8, **kw)
         self.export_callback = None
+        self.segment_export_callback = None
         self._build()
 
     # ----------------------------------------------------------
@@ -181,6 +182,44 @@ class SettingsPanel(ttk.LabelFrame):
         self.export_status_var = tk.StringVar(value="就绪")
         ttk.Label(tab_export, textvariable=self.export_status_var).grid(
             row=r, column=0, columnspan=3)
+        r += 1
+
+        ttk.Separator(tab_export, orient=tk.HORIZONTAL).grid(
+            row=r, column=0, columnspan=3, sticky=tk.EW, pady=8)
+        r += 1
+
+        seg_frame = ttk.LabelFrame(tab_export, text="分段导出", padding=6)
+        seg_frame.grid(row=r, column=0, columnspan=3, sticky=tk.EW)
+        seg_frame.columnconfigure(0, weight=1)
+        r += 1
+
+        tip_text = ("仅导出时间轴的有效部分\n被裁剪掉的区间不会导出）\n"
+                    "若不想导出暂停片段\n请先到“暂停处理”页点击“全部裁剪”")
+        ttk.Label(seg_frame, text=tip_text, foreground="#666666",
+                  justify=tk.LEFT).grid(row=0, column=0, sticky=tk.W, pady=(0, 4))
+
+        self.segment_split_by_speed_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            seg_frame,
+            text="按变速类型进一步区分\n（pause/2x/1x/0.2x/other）",
+            variable=self.segment_split_by_speed_var).grid(
+            row=1, column=0, sticky=tk.W, pady=2)
+
+        self.segment_export_btn = ttk.Button(
+            seg_frame, text="导出分段视频", command=self._on_segment_export)
+        self.segment_export_btn.grid(row=2, column=0, sticky=tk.W, pady=(4, 2))
+
+        self.segment_export_progress_var = tk.DoubleVar()
+        ttk.Progressbar(seg_frame, variable=self.segment_export_progress_var,
+                        maximum=100).grid(row=3, column=0, sticky=tk.EW, pady=2)
+
+        self.segment_export_status_var = tk.StringVar(value="就绪")
+        ttk.Label(seg_frame, textvariable=self.segment_export_status_var).grid(
+            row=4, column=0, sticky=tk.W, pady=(2, 0))
+
+        #audio_tip = "提示：分段导出默认不保留音频\n避免音画错位/拖尾"
+        #ttk.Label(seg_frame, text=audio_tip, foreground="#666666").grid(
+        #    row=5, column=0, sticky=tk.W, pady=(4, 0))
 
     # ----------------------------------------------------------
     def _browse_output(self):
@@ -193,6 +232,10 @@ class SettingsPanel(ttk.LabelFrame):
     def _on_export(self):
         if self.export_callback:
             self.export_callback()
+
+    def _on_segment_export(self):
+        if self.segment_export_callback:
+            self.segment_export_callback()
 
     def _on_apply_pause(self, mode: str):
         """触发播放器的批量暂停模式应用"""
