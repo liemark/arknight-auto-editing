@@ -3,6 +3,8 @@
 import cv2
 import numpy as np
 import os
+import shutil
+import subprocess
 import concurrent.futures
 import multiprocessing
 from frame_types import (FRAME_TYPE_NORMAL, FRAME_TYPE_PAUSE,
@@ -410,9 +412,8 @@ def build_delete_set(total: int, states: np.ndarray,
     return del_mask
 
 
-def export_video(video_path: str, output_path: str,
-                 to_del,
-                 fps: float, quality: int, progress_cb=None):
+def export_video(video_path: str, output_path: str,to_del,
+                 fps: float, quality: int, progress_cb=None,use_gpu: bool = False):
     """顺序读取并写入保留帧"""
     cap   = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -424,43 +425,56 @@ def export_video(video_path: str, output_path: str,
                 mask[idx] = True
         to_del = mask
 
-    try:
-        import imageio
-        writer = imageio.get_writer(output_path, fps=fps, codec='libx264',
-                                    quality=quality, pixelformat='yuv420p')
-        use_imageio = True
-    except ImportError:
-        use_imageio = False
-        ret, sample = cap.read()
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        if not ret:
-            raise RuntimeError("无法读取视频帧")
-        h, w = sample.shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+    ret, sample = cap.read()
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    if not ret:
+        raise RuntimeError("无法读取视频帧")
+    h, w = sample.shape[:2]
+
+    writer_kind = None
+    ffmpeg_proc = None
+    writer = None
+
+    if shutil.which("ffmpeg"):
+        ffmpeg_proc = _open_ffmpeg_pipe_writer(
+            output_path, fps, w, h, quality, use_gpu=use_gpu)
+        writer_kind = "ffmpeg"
+    else:
+        try:
+            import imageio
+            writer = imageio.get_writer(output_path, fps=fps, codec='libx264',
+                                        quality=quality, pixelformat='yuv420p')
+            writer_kind = "imageio"
+        except ImportError:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+            writer_kind = "cv2"
 
     written = 0
-    for idx in range(total):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if not to_del[idx]:
-            if use_imageio:
-                writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            else:
-                writer.write(frame)
-            written += 1
-        if progress_cb and idx % 60 == 0:
-            progress_cb(idx / total, written)
+    try:
+        for idx in range(total):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if not to_del[idx]:
+                if writer_kind == "ffmpeg":
+                    ffmpeg_proc.stdin.write(frame.tobytes())
+                elif writer_kind == "imageio":
+                    writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                else:
+                    writer.write(frame)
+                written += 1
+            if progress_cb and idx % 60 == 0:
+                progress_cb(idx / total, written)
+    finally:
+        _close_video_writer(writer_kind, writer, ffmpeg_proc)
 
-    writer.close() if use_imageio else writer.release()
     cap.release()
     return written, total
 
 
-def export_frame_range(video_path: str, output_path: str,
-                       start_frame: int, end_frame: int,
-                       fps: float, quality: int, progress_cb=None):
+def export_frame_range(video_path: str, output_path: str,start_frame: int, end_frame: int,
+                       fps: float, quality: int, progress_cb=None,use_gpu: bool = False):
     """导出闭区间 [start_frame, end_frame] 的视频（不含音频）"""
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -476,36 +490,111 @@ def export_frame_range(video_path: str, output_path: str,
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, s)
 
-    try:
-        import imageio
-        writer = imageio.get_writer(output_path, fps=fps, codec='libx264',
-                                    quality=quality, pixelformat='yuv420p')
-        use_imageio = True
-    except ImportError:
-        use_imageio = False
-        ret, sample = cap.read()
-        cap.set(cv2.CAP_PROP_POS_FRAMES, s)
-        if not ret:
-            cap.release()
-            raise RuntimeError("无法读取视频帧")
-        h, w = sample.shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+    ret, sample = cap.read()
+    cap.set(cv2.CAP_PROP_POS_FRAMES, s)
+    if not ret:
+        cap.release()
+        raise RuntimeError("无法读取视频帧")
+    h, w = sample.shape[:2]
+
+    writer_kind = None
+    ffmpeg_proc = None
+    writer = None
+
+    if shutil.which("ffmpeg"):
+        ffmpeg_proc = _open_ffmpeg_pipe_writer(
+            output_path, fps, w, h, quality, use_gpu=use_gpu)
+        writer_kind = "ffmpeg"
+    else:
+        try:
+            import imageio
+            writer = imageio.get_writer(output_path, fps=fps, codec='libx264',
+                                        quality=quality, pixelformat='yuv420p')
+            writer_kind = "imageio"
+        except ImportError:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+            writer_kind = "cv2"
 
     seg_len = e - s + 1
     written = 0
-    for i in range(seg_len):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if use_imageio:
-            writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        else:
-            writer.write(frame)
-        written += 1
-        if progress_cb and i % 30 == 0:
-            progress_cb((i + 1) / seg_len, written)
+    try:
+        for i in range(seg_len):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if writer_kind == "ffmpeg":
+                ffmpeg_proc.stdin.write(frame.tobytes())
+            elif writer_kind == "imageio":
+                writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            else:
+                writer.write(frame)
+            written += 1
+            if progress_cb and i % 30 == 0:
+                progress_cb((i + 1) / seg_len, written)
+    finally:
+        _close_video_writer(writer_kind, writer, ffmpeg_proc)
 
-    writer.close() if use_imageio else writer.release()
     cap.release()
     return written, seg_len
+
+
+def _pick_gpu_encoder() -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            text=True, stderr=subprocess.STDOUT)
+    except Exception:
+        return None
+
+    candidates = [
+        "h264_nvenc",
+        "h264_qsv",
+        "h264_amf",
+        "h264_videotoolbox",
+    ]
+    for enc in candidates:
+        if enc in out:
+            return enc
+    return None
+
+
+def _open_ffmpeg_pipe_writer(output_path: str, fps: float, w: int, h: int,
+                             quality: int, use_gpu: bool):
+    q = max(0, min(10, int(quality)))
+    crf = int(round(28 - q))
+    base_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{w}x{h}",
+        "-r", f"{fps}",
+        "-i", "-",
+        "-an",
+    ]
+
+    if use_gpu:
+        enc = _pick_gpu_encoder()
+        if enc:
+            if enc == "h264_nvenc":
+                cmd = base_cmd + ["-c:v", enc, "-preset", "p4", "-cq", str(18 + (10 - q)), output_path]
+            elif enc == "h264_qsv":
+                cmd = base_cmd + ["-c:v", enc, "-global_quality", str(18 + (10 - q)), output_path]
+            else:
+                cmd = base_cmd + ["-c:v", enc, "-q:v", str(18 + (10 - q)), output_path]
+            return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    cmd = base_cmd + ["-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", output_path]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _close_video_writer(writer_kind, writer, ffmpeg_proc):
+    if writer_kind == "ffmpeg" and ffmpeg_proc:
+        ffmpeg_proc.stdin.close()
+        _, err = ffmpeg_proc.communicate()
+        if ffmpeg_proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg 编码失败: {err.decode('utf-8', errors='ignore')}")
+    elif writer_kind == "imageio" and writer:
+        writer.close()
+    elif writer_kind == "cv2" and writer:
+        writer.release()

@@ -693,7 +693,7 @@ class VideoPreviewPlayer(tk.Frame):
             try:
                 written, total = analyzer.export_video(
                     self.video_path, p['output'], to_del,
-                    self.fps, p['quality'], prog)
+                    self.fps, p['quality'], prog,use_gpu=p.get('export_use_gpu', False))
                 self.after(0, lambda: self.settings.export_status_var.set(
                     f"完成！{written}/{total} 帧"))
                 self.after(0, lambda: messagebox.showinfo(
@@ -800,7 +800,7 @@ class VideoPreviewPlayer(tk.Frame):
 
         def worker():
             total = len(segs)
-            pad = max(3, len(str(total)))
+            pad = max(1, len(str(total)))
             exported = 0
 
             for idx, seg in enumerate(segs, start=1):
@@ -810,7 +810,8 @@ class VideoPreviewPlayer(tk.Frame):
                     analyzer.export_frame_range(
                         self.video_path, final_path,
                         seg['start'], seg['end'],
-                        self.fps, p['quality'])
+                        self.fps, p['quality'],
+                        use_gpu=p.get('export_use_gpu', False))
                     exported += 1
                 except Exception:
                     if os.path.exists(final_path):

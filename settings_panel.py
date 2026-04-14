@@ -3,6 +3,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog
 import os
+import subprocess
 
 
 class SettingsPanel(ttk.LabelFrame):
@@ -193,6 +194,8 @@ class SettingsPanel(ttk.LabelFrame):
         seg_frame.columnconfigure(0, weight=1)
         r += 1
 
+
+
         tip_text = ("仅导出时间轴的有效部分\n被裁剪掉的区间不会导出）\n"
                     "若不想导出暂停片段\n请先到“暂停处理”页点击“全部裁剪”")
         ttk.Label(seg_frame, text=tip_text, foreground="#666666",
@@ -216,6 +219,21 @@ class SettingsPanel(ttk.LabelFrame):
         self.segment_export_status_var = tk.StringVar(value="就绪")
         ttk.Label(seg_frame, textvariable=self.segment_export_status_var).grid(
             row=4, column=0, sticky=tk.W, pady=(2, 0))
+
+        self.export_use_gpu_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            tab_export, text="启用 GPU 导出加速(FFmpeg)",
+            variable=self.export_use_gpu_var).grid(
+            row=r, column=0, columnspan=3, sticky=tk.W, pady=(6, 2))
+        r += 1
+
+        self.gpu_encoder_hint = tk.StringVar(value="")
+        ttk.Label(tab_export, textvariable=self.gpu_encoder_hint,
+                  foreground="#666666", justify=tk.LEFT).grid(
+            row=r, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+        r += 1
+
+        self._detect_gpu_encoder()
 
         #audio_tip = "提示：分段导出默认不保留音频\n避免音画错位/拖尾"
         #ttk.Label(seg_frame, text=audio_tip, foreground="#666666").grid(
@@ -242,6 +260,25 @@ class SettingsPanel(ttk.LabelFrame):
         if hasattr(self, 'apply_pause_callback') and self.apply_pause_callback:
             self.apply_pause_callback(mode)
 
+    def _detect_gpu_encoder(self):
+        """检测可用的 GPU 编码器并设置导出默认值。"""
+        try:
+            out = subprocess.check_output(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                text=True, stderr=subprocess.STDOUT)
+            candidates = ("h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox")
+            gpu_encoder = next((enc for enc in candidates if enc in out), None)
+            if gpu_encoder:
+                self.gpu_encoder_hint.set(f"检测到可用的GPU编码器:\n {gpu_encoder}")
+                self.export_use_gpu_var.set(True)
+            else:
+                self.gpu_encoder_hint.set("未检测到GPU编码器，将使用CPU编码")
+                self.export_use_gpu_var.set(False)
+        except Exception as e:
+            self.gpu_encoder_hint.set("未找到FFmpeg，请确认已安装并添加到PATH")
+            self.export_use_gpu_var.set(False)
+            print(f"GPU编码器检测失败: {e}")
+
     def get_params(self) -> dict:
         """一次性读取所有参数，返回纯 Python 字典（无 tkinter 依赖）"""
         return {
@@ -267,4 +304,5 @@ class SettingsPanel(ttk.LabelFrame):
             },
             'output':  self.output_var.get(),
             'quality': self.quality_var.get(),
+            'export_use_gpu': self.export_use_gpu_var.get(),
         }
