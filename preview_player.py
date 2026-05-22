@@ -57,6 +57,8 @@ class VideoPreviewPlayer(tk.Frame):
         self._io: VideoIOThread | None = None
         self._frame_q: Queue = Queue(maxsize=2)
         self._canvas_img_id = None
+        self._audio_proc = None
+        self.preview_audio_var = tk.BooleanVar(value=True)
 
         # 键盘连续移动状态
         self._key_held:       str | None = None
@@ -78,6 +80,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.video_canvas = tk.Canvas(self, width=self.canvas_w,
                                       height=self.canvas_h, bg="black")
         self.video_canvas.pack(pady=5, fill=tk.BOTH, expand=True)
+        self.video_canvas.bind("<Configure>", self._on_canvas_resize)
         self.video_canvas.bind("<Button-1>",
                                lambda e: self.video_canvas.focus_set())
 
@@ -115,19 +118,23 @@ class VideoPreviewPlayer(tk.Frame):
         ttk.Checkbutton(ctrl, text="预览时跳过裁剪区",
                         variable=self.skip_trimmed).pack(side=tk.LEFT, padx=5)
 
+        ttk.Checkbutton(ctrl, text="音频预览",
+                        variable=self.preview_audio_var).pack(side=tk.LEFT, padx=2)
+        self.preview_audio_var.trace_add('write', self._on_audio_toggle)
+
         self.lbl_time = ttk.Label(ctrl, text="00:00 / 00:00")
         self.lbl_time.pack(side=tk.RIGHT, padx=10)
 
         # 状态栏
         self.lbl_info = ttk.Label(self, text="就绪",
-                                  foreground="#00CED1", font=("Consolas", 10))
+                                  foreground="#00CED1", font=("黑体", 10))
         self.lbl_info.pack(fill=tk.X, padx=10, pady=2)
 
         # 操作提示
         hint = ("← → 逐帧/连续移动  |  空格 播放/暂停  |  "
                 "连续移动速度可在「基本」设置里调整")
         ttk.Label(self, text=hint, foreground="#555555",
-                  font=("Consolas", 8)).pack(fill=tk.X, padx=10, pady=(0, 2))
+                  font=("黑体", 8)).pack(fill=tk.X, padx=10, pady=(0, 2))
 
         self._render_loop()
 
@@ -139,6 +146,7 @@ class VideoPreviewPlayer(tk.Frame):
     #  视频加载
     # ==========================================================
     def load_video(self, path: str):
+        self._stop_audio()
         if self._io and self._io.is_alive():
             self._io.stop_and_quit()
             self._io = None
@@ -239,14 +247,15 @@ class VideoPreviewPlayer(tk.Frame):
     def _send_play(self, start: int):
         if not self._io:
             return
-        p = self.settings.get_params()
-
-        # 解析倍速字符串 → step（抽帧）+ multiplier（帧间隔倍数）
+        # 解析倍速字符串
         speed_str = self.preview_speed_var.get().rstrip('x')
         try:
             speed = float(speed_str)
         except ValueError:
             speed = 1.0
+        self._start_audio(start, speed)
+        p = self.settings.get_params()
+
         if speed >= 1.0:
             preview_step       = max(1, int(speed))
             speed_multiplier   = 1.0
@@ -273,6 +282,109 @@ class VideoPreviewPlayer(tk.Frame):
     def _send_stop(self):
         if self._io:
             self._io.send({'type': CMD_STOP})
+        self._stop_audio()
+
+    # ==========================================================
+    #  音频预览
+    # ==========================================================
+
+    @staticmethod
+    def _build_atempo_filter(speed: float) -> str:
+        """构建 atempo 滤镜链，将音频变速至目标倍速。
+        atempo 单次范围 [0.5, 2.0]，超出范围时连锁多个滤镜。"""
+        if speed == 1.0:
+            return ""
+        remaining = speed
+        parts = []
+        while remaining >= 2.0:
+            parts.append("atempo=2.0")
+            remaining /= 2.0
+        while remaining <= 0.5:
+            parts.append("atempo=0.5")
+            remaining /= 0.5
+        if 0.5 < remaining < 2.0 and abs(remaining - 1.0) > 0.001:
+            parts.append(f"atempo={remaining:.3f}")
+        return ",".join(parts)
+
+    def _build_audio_keep_intervals(self, start_frame: int) -> list:
+        """从跳过区间反算出需要保留的音频时间区间 [si,ei)/fps。"""
+        skip_segs = self._all_skip_segs_snap()
+        total_time = self.total_frames / self.fps if self.fps else 0
+        skip_times = sorted(
+            (s / self.fps, min(e, self.total_frames) / self.fps)
+            for s, e in skip_segs if e > s and s < self.total_frames)
+        if not skip_times:
+            return [(start_frame / self.fps, total_time)]
+        keeps = []
+        cur = start_frame / self.fps
+        for ss, se in skip_times:
+            if ss > cur:
+                keeps.append((cur, min(ss, total_time)))
+            cur = max(cur, se)
+        if cur < total_time:
+            keeps.append((cur, total_time))
+        return keeps
+
+    def _start_audio(self, start_frame: int, speed: float = 1.0):
+        self._stop_audio()
+        if not self.video_path or not self.preview_audio_var.get():
+            return
+        if not self.fps:
+            return
+
+        atempo = self._build_atempo_filter(speed)
+        filter_parts = []
+
+        if self.skip_trimmed.get():
+            intervals = self._build_audio_keep_intervals(start_frame)
+            if intervals:
+                expr = "+".join(
+                    f"between(t,{s:.3f},{e:.3f})" for s, e in intervals)
+                filter_parts.append(f"aselect='{expr}',asetpts=N/SR/TB")
+
+        filter_parts.append("volume=0.3")
+        if atempo:
+            filter_parts.append(atempo)
+        audio_filter = ",".join(filter_parts)
+
+        try:
+            self._audio_proc = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit",
+                 "-i", self.video_path, "-loglevel", "quiet",
+                 "-af", audio_filter],
+                stdin=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+        except Exception:
+            self._audio_proc = None
+
+    def _stop_audio(self):
+        proc, self._audio_proc = self._audio_proc, None
+        if proc:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=1)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def _on_audio_toggle(self, *args):
+        if self.preview_audio_var.get():
+            if self.is_playing:
+                speed_str = self.preview_speed_var.get().rstrip('x')
+                try:
+                    speed = float(speed_str)
+                except ValueError:
+                    speed = 1.0
+                self._start_audio(self.current_frame_idx, speed)
+        else:
+            self._stop_audio()
 
     # ==========================================================
     #  键盘快捷键
@@ -461,9 +573,19 @@ class VideoPreviewPlayer(tk.Frame):
         self.after(16, self._render_loop)
 
     def _display_rgb(self, rgb: np.ndarray):
-        img   = PIL.Image.fromarray(rgb)
-        photo = PIL.ImageTk.PhotoImage(image=img)
         cw, ch = self._canvas_wh()
+        fh, fw = rgb.shape[:2]
+        if fw != cw or fh != ch:
+            scale = min(cw / fw, ch / fh, 1.0)
+            nw = max(1, int(fw * scale))
+            nh = max(1, int(fh * scale))
+            if nw != fw or nh != fh:
+                rgb = PIL.Image.fromarray(rgb).resize((nw, nh), PIL.Image.LANCZOS)
+            else:
+                rgb = PIL.Image.fromarray(rgb)
+        else:
+            rgb = PIL.Image.fromarray(rgb)
+        photo = PIL.ImageTk.PhotoImage(image=rgb)
         if self._canvas_img_id is None:
             self.video_canvas.delete("all")
             self._canvas_img_id = self.video_canvas.create_image(
@@ -473,6 +595,13 @@ class VideoPreviewPlayer(tk.Frame):
             self.video_canvas.itemconfig(self._canvas_img_id, image=photo)
         self._photo = photo
         self._update_labels()
+
+    def _on_canvas_resize(self, event=None):
+        if self._canvas_img_id is not None:
+            self.video_canvas.coords(
+                self._canvas_img_id,
+                self.video_canvas.winfo_width() // 2,
+                self.video_canvas.winfo_height() // 2)
 
     # ==========================================================
     #  标签更新
@@ -695,10 +824,10 @@ class VideoPreviewPlayer(tk.Frame):
                     self.video_path, p['output'], to_del,
                     self.fps, p['quality'], prog,use_gpu=p.get('export_use_gpu', False))
                 self.after(0, lambda: self.settings.export_status_var.set(
-                    f"完成！{written}/{total} 帧"))
+                    f"完成！{written}/{total} 帧（已同步音频）"))
                 self.after(0, lambda: messagebox.showinfo(
                     "导出完成",
-                    f"输出：{p['output']}\n总帧：{total}，保留：{written}"))
+                    f"输出：{p['output']}\n总帧：{total}，保留：{written}\n已同步合并音频"))
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("导出失败", str(e)))
             finally:
@@ -824,11 +953,11 @@ class VideoPreviewPlayer(tk.Frame):
                         f"导出分段 {i}/{t}")))
 
             self.after(0, lambda: self.settings.segment_export_status_var.set(
-                f"完成：{exported}/{total} 段（分段导出默认不保留音频）"))
+                f"完成：{exported}/{total} 段（已同步音频）"))
             self.after(0, lambda: messagebox.showinfo(
                 "分段导出完成",
                 f"输出目录：{out_dir}\n完成：{exported}/{total} 段\n"
-                "说明：分段导出默认不保留音频，以避免音画错位/拖尾问题。"))
+                "说明：已同步合并音频。"))
             self.after(0, lambda: self.settings.segment_export_btn.config(state=tk.NORMAL))
 
         threading.Thread(target=worker, daemon=True).start()

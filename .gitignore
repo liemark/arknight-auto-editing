@@ -1,0 +1,7 @@
+.venv
+.kilo
+__pycache__
+build
+dist
+ArknightsAutoEditor_v1.0.zip
+ArknightsAutoEditor.spec

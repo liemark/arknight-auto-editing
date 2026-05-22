@@ -1,7 +1,7 @@
 # main.py —— 程序入口（PanedWindow 实现可拖动左右分隔）
 
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, font
 import os
 import multiprocessing   # ProcessPoolExecutor 需要在入口处 freeze_support
 
@@ -14,6 +14,10 @@ def main():
     root.title("明日方舟剪辑工具")
     root.geometry("1380x920")
     root.minsize(900, 600)
+
+    default_font = font.nametofont("TkDefaultFont")
+    default_font.configure(family="黑体", size=10)
+    root.option_add("*Font", "黑体 10")
 
     # 顶部工具栏
     top = ttk.Frame(root)

@@ -7,6 +7,26 @@ import shutil
 import subprocess
 import concurrent.futures
 import multiprocessing
+import tempfile
+
+import sys
+
+_NO_WINDOW = 0x08000000 if sys.platform == 'win32' else 0
+
+def _resource_path(rel: str) -> str:
+    """定位资源目录/文件。依次尝试嵌入目录、EXE 同目录、脚本目录。"""
+    if getattr(sys, 'frozen', False):
+        for base in (sys._MEIPASS, os.path.dirname(sys.executable)):
+            candidate = os.path.join(base, rel)
+            if os.path.exists(candidate):
+                return candidate
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
+
+_LOCAL_FFMPEG_DIR = _resource_path(os.path.join(".kilo", "tools"))
+if os.path.isdir(_LOCAL_FFMPEG_DIR):
+    os.environ.setdefault("PATH", "")
+    os.environ["PATH"] = _LOCAL_FFMPEG_DIR + os.pathsep + os.environ["PATH"]
+
 from frame_types import (FRAME_TYPE_NORMAL, FRAME_TYPE_PAUSE,
                           FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X)
 
@@ -19,7 +39,6 @@ TEMPLATE_DIRS = {
     'pause':      {'ref_dir': 'templates_pause',  'source_dir': 'source_images_pause'},
     'speed_1x':   {'ref_dir': 'templates_1x',     'source_dir': 'source_images_1x'},
     'speed_2x':   {'ref_dir': 'templates_2x',     'source_dir': 'source_images_2x'},
-    'speed_0_2x': {'ref_dir': 'templates_play',   'source_dir': 'source_images_play'},
 }
 
 IMG_EXTS = ('.png', '.jpg', '.bmp', '.jpeg')
@@ -36,7 +55,8 @@ def load_templates(proc_res: tuple = (400, 225)) -> tuple[dict, int]:
     total = 0
 
     for ctype, dirs in TEMPLATE_DIRS.items():
-        src_dir, ref_dir = dirs['source_dir'], dirs['ref_dir']
+        src_dir = _resource_path(dirs['source_dir'])
+        ref_dir = _resource_path(dirs['ref_dir'])
         if not os.path.exists(src_dir) or not os.path.exists(ref_dir): continue
 
         src_files = [f for f in os.listdir(src_dir) if f.lower().endswith(IMG_EXTS)]
@@ -102,12 +122,12 @@ def _classify_gray(gray: np.ndarray, configs: dict,
     """对已缩放好的灰度图做模板匹配分类"""
     if configs['pause'] and _get_best_score(gray, configs['pause'], proc_res) >= thresholds['pause']:
         return FRAME_TYPE_PAUSE
-    x1s = _get_best_score(gray, configs['speed_1x'], proc_res) if configs['speed_1x'] else -1.0
-    x2s = _get_best_score(gray, configs['speed_2x'], proc_res) if configs['speed_2x'] else -1.0
-    if x1s >= thresholds['speed_1x'] and x1s > x2s: return FRAME_TYPE_1X
-    if x2s >= thresholds['speed_2x'] and x2s > x1s: return FRAME_TYPE_2X
-    if configs['speed_0_2x'] and _get_best_score(gray, configs['speed_0_2x'], proc_res) >= thresholds['speed_0_2x']:
-        return FRAME_TYPE_0_2X
+    x1s = _get_best_score(gray, configs.get('speed_1x', []), proc_res)
+    x2s = _get_best_score(gray, configs.get('speed_2x', []), proc_res)
+    x02 = _get_best_score(gray, configs.get('speed_0_2x', []), proc_res)
+    if x1s >= thresholds['speed_1x'] and x1s >= x2s and x1s >= x02: return FRAME_TYPE_1X
+    if x2s >= thresholds['speed_2x'] and x2s >= x1s and x2s >= x02: return FRAME_TYPE_2X
+    if x02 >= thresholds['speed_0_2x'] and x02 >= x1s and x02 >= x2s: return FRAME_TYPE_0_2X
     return FRAME_TYPE_NORMAL
 
 
@@ -412,9 +432,88 @@ def build_delete_set(total: int, states: np.ndarray,
     return del_mask
 
 
+# ---------------------------------------------------------------
+#  音频同步辅助
+# ---------------------------------------------------------------
+
+def _kept_intervals(to_del: np.ndarray, fps: float) -> list:
+    """将 to_del bool mask 转为 [(start_sec, end_sec), ...] 保留区间列表。"""
+    intervals = []
+    i = 0
+    total = len(to_del)
+    while i < total:
+        if not to_del[i]:
+            start = i
+            while i < total and not to_del[i]:
+                i += 1
+            end = i - 1
+            intervals.append((start / fps, (end + 1) / fps))
+        else:
+            i += 1
+    return intervals
+
+
+def _merge_audio(input_video: str, video_only_path: str,
+                 output_path: str, kept_intervals: list):
+    """
+    使用 FFmpeg concat demuxer 从原始视频提取多个音频段并拼接，
+    与 video_only_path 的视频混流到 output_path。
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        concat_file = os.path.join(tmpdir, "segments.txt")
+        with open(concat_file, "w") as f:
+            for start_sec, end_sec in kept_intervals:
+                f.write(f"file '{input_video}'\n")
+                f.write(f"inpoint {start_sec}\n")
+                f.write(f"outpoint {end_sec}\n")
+
+        audio_out = os.path.join(tmpdir, "audio.aac")
+
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+             "-i", concat_file, "-vn", "-c:a", "aac", "-threads", "0",
+             audio_out],
+            check=True, capture_output=True, timeout=600,
+            creationflags=_NO_WINDOW)
+
+        subprocess.run(
+            ["ffmpeg", "-y",
+             "-i", video_only_path,
+             "-i", audio_out,
+             "-c:v", "copy",
+             "-c:a", "copy",
+             "-map", "0:v:0",
+             "-map", "1:a:0",
+             "-shortest",
+             output_path],
+            check=True, capture_output=True, timeout=600,
+            creationflags=_NO_WINDOW)
+
+
+def _merge_audio_range(input_video: str, video_only_path: str,
+                       output_path: str, start_sec: float, end_sec: float):
+    """
+    单段连续区间：从原始视频提取 [start_sec, end_sec) 音频并与视频混流。
+    """
+    subprocess.run(
+        ["ffmpeg", "-y",
+         "-i", video_only_path,
+         "-ss", str(start_sec),
+         "-to", str(end_sec),
+         "-i", input_video,
+         "-c:v", "copy",
+         "-c:a", "aac", "-threads", "0",
+         "-map", "0:v:0",
+         "-map", "1:a:0",
+         "-shortest",
+         output_path],
+        check=True, capture_output=True, timeout=600,
+        creationflags=_NO_WINDOW)
+
+
 def export_video(video_path: str, output_path: str,to_del,
                  fps: float, quality: int, progress_cb=None,use_gpu: bool = False):
-    """顺序读取并写入保留帧"""
+    """顺序读取并写入保留帧，再同步合并原始音频。"""
     cap   = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -431,23 +530,25 @@ def export_video(video_path: str, output_path: str,to_del,
         raise RuntimeError("无法读取视频帧")
     h, w = sample.shape[:2]
 
+    tmp_path = output_path + ".tmp.mp4"
+
     writer_kind = None
     ffmpeg_proc = None
     writer = None
 
     if shutil.which("ffmpeg"):
         ffmpeg_proc = _open_ffmpeg_pipe_writer(
-            output_path, fps, w, h, quality, use_gpu=use_gpu)
+            tmp_path, fps, w, h, quality, use_gpu=use_gpu)
         writer_kind = "ffmpeg"
     else:
         try:
             import imageio
-            writer = imageio.get_writer(output_path, fps=fps, codec='libx264',
+            writer = imageio.get_writer(tmp_path, fps=fps, codec='libx264',
                                         quality=quality, pixelformat='yuv420p')
             writer_kind = "imageio"
         except ImportError:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+            writer = cv2.VideoWriter(tmp_path, fourcc, fps, (w, h))
             writer_kind = "cv2"
 
     written = 0
@@ -470,12 +571,35 @@ def export_video(video_path: str, output_path: str,to_del,
         _close_video_writer(writer_kind, writer, ffmpeg_proc)
 
     cap.release()
+
+    # 音频同步：将原始音频按保留帧区间裁剪后混流
+    if written > 0 and shutil.which("ffmpeg"):
+        try:
+            intervals = _kept_intervals(to_del, fps)
+            if intervals:
+                _merge_audio(video_path, tmp_path, output_path, intervals)
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            else:
+                shutil.move(tmp_path, output_path)
+        except Exception:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            shutil.move(tmp_path, output_path)
+    else:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        if written > 0:
+            shutil.move(tmp_path, output_path)
+        elif os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
     return written, total
 
 
 def export_frame_range(video_path: str, output_path: str,start_frame: int, end_frame: int,
                        fps: float, quality: int, progress_cb=None,use_gpu: bool = False):
-    """导出闭区间 [start_frame, end_frame] 的视频（不含音频）"""
+    """导出闭区间 [start_frame, end_frame] 的视频（同步合并音频）"""
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total <= 0:
@@ -497,23 +621,25 @@ def export_frame_range(video_path: str, output_path: str,start_frame: int, end_f
         raise RuntimeError("无法读取视频帧")
     h, w = sample.shape[:2]
 
+    tmp_path = output_path + ".tmp.mp4"
+
     writer_kind = None
     ffmpeg_proc = None
     writer = None
 
     if shutil.which("ffmpeg"):
         ffmpeg_proc = _open_ffmpeg_pipe_writer(
-            output_path, fps, w, h, quality, use_gpu=use_gpu)
+            tmp_path, fps, w, h, quality, use_gpu=use_gpu)
         writer_kind = "ffmpeg"
     else:
         try:
             import imageio
-            writer = imageio.get_writer(output_path, fps=fps, codec='libx264',
+            writer = imageio.get_writer(tmp_path, fps=fps, codec='libx264',
                                         quality=quality, pixelformat='yuv420p')
             writer_kind = "imageio"
         except ImportError:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+            writer = cv2.VideoWriter(tmp_path, fourcc, fps, (w, h))
             writer_kind = "cv2"
 
     seg_len = e - s + 1
@@ -536,6 +662,27 @@ def export_frame_range(video_path: str, output_path: str,start_frame: int, end_f
         _close_video_writer(writer_kind, writer, ffmpeg_proc)
 
     cap.release()
+
+    # 音频同步：单段连续区间直接用 -ss / -to 提取并混流
+    if written > 0 and shutil.which("ffmpeg"):
+        try:
+            start_sec = s / fps
+            end_sec   = (e + 1) / fps
+            _merge_audio_range(video_path, tmp_path, output_path, start_sec, end_sec)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            shutil.move(tmp_path, output_path)
+    else:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        if written > 0:
+            shutil.move(tmp_path, output_path)
+        elif os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
     return written, seg_len
 
 
@@ -577,15 +724,21 @@ def _open_ffmpeg_pipe_writer(output_path: str, fps: float, w: int, h: int,
         enc = _pick_gpu_encoder()
         if enc:
             if enc == "h264_nvenc":
-                cmd = base_cmd + ["-c:v", enc, "-preset", "p4", "-cq", str(18 + (10 - q)), output_path]
+                cmd = base_cmd + ["-c:v", enc, "-preset", "p4", "-cq", str(18 + (10 - q)),
+                                  "-threads", "0", output_path]
             elif enc == "h264_qsv":
-                cmd = base_cmd + ["-c:v", enc, "-global_quality", str(18 + (10 - q)), output_path]
+                cmd = base_cmd + ["-c:v", enc, "-global_quality", str(18 + (10 - q)),
+                                  "-threads", "0", output_path]
             else:
-                cmd = base_cmd + ["-c:v", enc, "-q:v", str(18 + (10 - q)), output_path]
-            return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                cmd = base_cmd + ["-c:v", enc, "-q:v", str(18 + (10 - q)),
+                                  "-threads", "0", output_path]
+            return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    creationflags=_NO_WINDOW)
 
-    cmd = base_cmd + ["-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", output_path]
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    cmd = base_cmd + ["-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p",
+                      "-threads", "0", output_path]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+                            creationflags=_NO_WINDOW)
 
 
 def _close_video_writer(writer_kind, writer, ffmpeg_proc):

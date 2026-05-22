@@ -4,6 +4,14 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 import os
 import subprocess
+import sys
+
+_LOCAL_FFMPEG_DIR = os.path.join(
+    os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__),
+    ".kilo", "tools")
+if os.path.isdir(_LOCAL_FFMPEG_DIR):
+    os.environ.setdefault("PATH", "")
+    os.environ["PATH"] = _LOCAL_FFMPEG_DIR + os.pathsep + os.environ["PATH"]
 
 
 class SettingsPanel(ttk.LabelFrame):
@@ -92,6 +100,32 @@ class SettingsPanel(ttk.LabelFrame):
 
         # ---- 暂停处理 ----
         r = 0
+
+        help_text = (
+            "画面对比：比较暂停段前后帧来判断是否存在场景跳变（关卡切换）。\n"
+            "  跳变 → 前后画面不同，保留过渡动画（按下方帧数）\n"
+            "  无跳变 → 前后画面相同（如看录像换关），整个暂停段全部删除\n"
+            "\n"
+            "DCT 低频差异阈值（推荐 30000~80000）：\n"
+            "  对画面做离散余弦变换，取左上 8×8 低频分量并求差值和。\n"
+            "  值越大表示画面差异越大。默认 50000 可覆盖多数场景。\n"
+            "\n"
+            "Hist 相似度阈值（推荐 0.90~0.98）：\n"
+            "  比较前后帧灰度直方图的相关系数，越接近 1 越相似。\n"
+            "  默认 0.95，配合 DCT 一起判断。\n"
+            "  两项同时满足（DCT < 阈值 且 Hist > 阈值）才判定为\"无跳变\"。\n"
+            "\n"
+            "保留前段/后段（帧数）：\n"
+            "  仅对\"有跳变\"的暂停段生效。在暂停段首尾各保留若干帧。\n"
+            "  前段（推荐 0~30）：跳变后进入暂停的过渡动画\n"
+            "  后段（推荐 30~90）：暂停结束恢复战斗的过渡动画\n"
+            "  默认前段=0 后段=60。若设为 0 则该侧全部删除。"
+        )
+        ttk.Label(tab_pause, text=help_text, foreground="#666666",
+                  justify=tk.LEFT, wraplength=320).grid(
+            row=r, column=0, columnspan=2, sticky=tk.W, pady=(0, 6))
+        r += 1
+
         self.compare_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(tab_pause, text="启用画面对比 (防止跳帧)",
                         variable=self.compare_var).grid(
@@ -262,10 +296,12 @@ class SettingsPanel(ttk.LabelFrame):
 
     def _detect_gpu_encoder(self):
         """检测可用的 GPU 编码器并设置导出默认值。"""
+        _NO_WINDOW = 0x08000000 if sys.platform == 'win32' else 0
         try:
             out = subprocess.check_output(
                 ["ffmpeg", "-hide_banner", "-encoders"],
-                text=True, stderr=subprocess.STDOUT)
+                text=True, stderr=subprocess.STDOUT,
+                creationflags=_NO_WINDOW)
             candidates = ("h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox")
             gpu_encoder = next((enc for enc in candidates if enc in out), None)
             if gpu_encoder:

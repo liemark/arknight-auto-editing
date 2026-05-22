@@ -91,7 +91,7 @@ class TimelineWidget(tk.Frame):
         hint = ("滚轮缩放  |  右键拖动平移  |  拖动 ▶ 红条定位  |  "
                 "拖动橙黄条调整暂停裁剪  |  拖动青条调整片段裁剪")
         tk.Label(self, text=hint, fg="#555555", bg="#1A1A1A",
-                 font=("Consolas", 8), anchor="w").pack(
+                 font=("黑体", 8), anchor="w").pack(
             fill=tk.X, padx=4, pady=(0, 2))
 
     # ------------------------------------------------------------------
@@ -265,7 +265,7 @@ class TimelineWidget(tk.Frame):
                 m, s = divmod(int(sec), 60)
                 label = f"{m}:{s:02d}" if m > 0 else f"{s}s"
                 self.canvas.create_text(px + 2, 3, anchor=tk.NW, text=label,
-                                        fill="#999999", font=("Consolas", 8))
+                                        fill="#999999", font=("黑体", 8))
             elif is_major:
                 self.canvas.create_line(px, h - 30, px, h - 20, fill="#666666", width=1)
             else:
