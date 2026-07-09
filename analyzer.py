@@ -7,56 +7,29 @@ import shutil
 import subprocess
 import concurrent.futures
 import multiprocessing
-import tempfile
-
-import sys
-
-_NO_WINDOW = 0x08000000 if sys.platform == 'win32' else 0
-
-def _resource_path(rel: str) -> str:
-    """定位资源目录/文件。依次尝试嵌入目录、EXE 同目录、脚本目录。"""
-    if getattr(sys, 'frozen', False):
-        for base in (sys._MEIPASS, os.path.dirname(sys.executable)):
-            candidate = os.path.join(base, rel)
-            if os.path.exists(candidate):
-                return candidate
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
-
-_LOCAL_FFMPEG_DIR = _resource_path(os.path.join(".kilo", "tools"))
-if os.path.isdir(_LOCAL_FFMPEG_DIR):
-    os.environ.setdefault("PATH", "")
-    os.environ["PATH"] = _LOCAL_FFMPEG_DIR + os.pathsep + os.environ["PATH"]
-
 from frame_types import (FRAME_TYPE_NORMAL, FRAME_TYPE_PAUSE,
-                          FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X)
-
+                         FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X)
 
 # ---------------------------------------------------------------
 #  模板加载（带预缩放缓存）
 # ---------------------------------------------------------------
 
 TEMPLATE_DIRS = {
-    'pause':      {'ref_dir': 'templates_pause',  'source_dir': 'source_images_pause'},
-    'speed_1x':   {'ref_dir': 'templates_1x',     'source_dir': 'source_images_1x'},
-    'speed_2x':   {'ref_dir': 'templates_2x',     'source_dir': 'source_images_2x'},
+    'pause': {'ref_dir': 'templates_pause', 'source_dir': 'source_images_pause'},
+    'speed_1x': {'ref_dir': 'templates_1x', 'source_dir': 'source_images_1x'},
+    'speed_2x': {'ref_dir': 'templates_2x', 'source_dir': 'source_images_2x'},
+    'speed_0_2x': {'ref_dir': 'templates_play', 'source_dir': 'source_images_play'},
 }
 
 IMG_EXTS = ('.png', '.jpg', '.bmp', '.jpeg')
 
 
 def load_templates(proc_res: tuple = (400, 225)) -> tuple[dict, int]:
-    """
-    加载所有模板并预缩放到 proc_res。
-    每个模板条目包含：
-      cached_proc_res / cached_roi / cached_t / cached_m：
-        预计算的 ROI 坐标和缩放后模板，每帧匹配时直接用，跳过 resize。
-    """
     configs: dict[str, list] = {k: [] for k in TEMPLATE_DIRS}
     total = 0
 
     for ctype, dirs in TEMPLATE_DIRS.items():
-        src_dir = _resource_path(dirs['source_dir'])
-        ref_dir = _resource_path(dirs['ref_dir'])
+        src_dir, ref_dir = dirs['source_dir'], dirs['ref_dir']
         if not os.path.exists(src_dir) or not os.path.exists(ref_dir): continue
 
         src_files = [f for f in os.listdir(src_dir) if f.lower().endswith(IMG_EXTS)]
@@ -119,81 +92,35 @@ def _get_best_score(gray_frame: np.ndarray, templates: list, proc_res: tuple) ->
 
 def _classify_gray(gray: np.ndarray, configs: dict,
                    thresholds: dict, proc_res: tuple) -> int:
-    """对已缩放好的灰度图做模板匹配分类"""
     if configs['pause'] and _get_best_score(gray, configs['pause'], proc_res) >= thresholds['pause']:
         return FRAME_TYPE_PAUSE
-    x1s = _get_best_score(gray, configs.get('speed_1x', []), proc_res)
-    x2s = _get_best_score(gray, configs.get('speed_2x', []), proc_res)
-    x02 = _get_best_score(gray, configs.get('speed_0_2x', []), proc_res)
-    if x1s >= thresholds['speed_1x'] and x1s >= x2s and x1s >= x02: return FRAME_TYPE_1X
-    if x2s >= thresholds['speed_2x'] and x2s >= x1s and x2s >= x02: return FRAME_TYPE_2X
-    if x02 >= thresholds['speed_0_2x'] and x02 >= x1s and x02 >= x2s: return FRAME_TYPE_0_2X
+    x1s = _get_best_score(gray, configs['speed_1x'], proc_res) if configs['speed_1x'] else -1.0
+    x2s = _get_best_score(gray, configs['speed_2x'], proc_res) if configs['speed_2x'] else -1.0
+    if x1s >= thresholds['speed_1x'] and x1s > x2s: return FRAME_TYPE_1X
+    if x2s >= thresholds['speed_2x'] and x2s > x1s: return FRAME_TYPE_2X
+    if configs['speed_0_2x'] and _get_best_score(gray, configs['speed_0_2x'], proc_res) >= thresholds['speed_0_2x']:
+        return FRAME_TYPE_0_2X
     return FRAME_TYPE_NORMAL
 
 
-def classify_frame(frame: np.ndarray, configs: dict,
-                   thresholds: dict, proc_res: tuple) -> int:
-    """将一帧 BGR 图像分类为 FRAME_TYPE_*（供外部直接调用）"""
-    resized = cv2.resize(frame, proc_res, interpolation=cv2.INTER_AREA)
-    gray    = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    return _classify_gray(gray, configs, thresholds, proc_res)
-
-
 # ---------------------------------------------------------------
-#  子进程全局状态（ProcessPoolExecutor initializer 模式）
-#
-#  子进程只接收已经 resize+cvtColor 过的灰度图（400×225×1），
-#  不接收原始 BGR 大帧（1920×1080×3）。
-#  pickle 体积从 ~6MB/帧 降到 ~90KB/帧，缓解 IPC 瓶颈。
-#
-#  帧缓存继承：连续相同帧跳过 matchTemplate，对1帧暂停安全。
+#  子进程全局状态
 # ---------------------------------------------------------------
 
-_worker_configs:    dict  = {}
-_worker_thresholds: dict  = {}
-_worker_proc_res:   tuple = (400, 225)
-_worker_prev_roi:   object = None
-_worker_prev_state: int   = FRAME_TYPE_NORMAL
-
-# 帧差只看图标 ROI（400×225 坐标系）
-_ROI_A = (180, 90, 260, 135)   # pause 字母区
-_ROI_B = (325,  0, 400,  30)   # 1x/2x + play 按钮（右上角）
-
-_SAME_FRAME_THRESH = 1.0   # 均值差阈值：编码噪声 ~0.67，图标变化 >1.5
+_worker_configs: dict = {}
+_worker_thresholds: dict = {}
+_worker_proc_res: tuple = (400, 225)
 
 
 def _worker_init(configs: dict, thresholds: dict, proc_res: tuple):
     global _worker_configs, _worker_thresholds, _worker_proc_res
-    global _worker_prev_roi, _worker_prev_state
-    _worker_configs    = configs
+    _worker_configs = configs
     _worker_thresholds = thresholds
-    _worker_proc_res   = proc_res
-    _worker_prev_roi   = None
-    _worker_prev_state = FRAME_TYPE_NORMAL
-
-
-def _extract_roi_strip(gray_proc: np.ndarray) -> np.ndarray:
-    a = gray_proc[_ROI_A[1]:_ROI_A[3], _ROI_A[0]:_ROI_A[2]]
-    b = gray_proc[_ROI_B[1]:_ROI_B[3], _ROI_B[0]:_ROI_B[2]]
-    return np.concatenate([a.ravel(), b.ravel()])
+    _worker_proc_res = proc_res
 
 
 def _worker_classify_gray(gray: np.ndarray) -> int:
-    """
-    子进程帧任务：接收已缩放好的灰度图（不再做 resize+cvtColor）。
-    1. 提取图标 ROI strip，与上一帧对比
-    2. diff < 阈值 → 直接继承，跳过 matchTemplate
-    3. 否则走 _classify_gray
-    """
-    global _worker_prev_roi, _worker_prev_state
-    roi_strip = _extract_roi_strip(gray)
-    if _worker_prev_roi is not None:
-        diff = float(np.mean(np.abs(roi_strip.astype(np.int16) - _worker_prev_roi.astype(np.int16))))
-        if diff < _SAME_FRAME_THRESH: return _worker_prev_state
-
-    state = _classify_gray(gray, _worker_configs, _worker_thresholds, _worker_proc_res)
-    _worker_prev_roi, _worker_prev_state = roi_strip, state
-    return state
+    return _classify_gray(gray, _worker_configs, _worker_thresholds, _worker_proc_res)
 
 
 # ---------------------------------------------------------------
@@ -202,170 +129,177 @@ def _worker_classify_gray(gray: np.ndarray) -> int:
 
 def analyze_video(video_path: str, configs: dict, thresholds: dict,
                   proc_res: tuple, batch_size: int, n_threads: int,
-                  progress_cb=None) -> np.ndarray:
-    """
-    流水线 + 多进程分类每帧。
-
-    IO 优化：读帧线程内完成 resize+cvtColor，只向队列放灰度图（~90KB），
-    不放原始 BGR 帧（~6MB）。pickle 体积缩小 60x，大幅降低 IPC 开销。
-
-    progress_cb(ratio: float) 在 [0, 1] 之间回调。
-    返回 np.ndarray[int8]，每元素为 FRAME_TYPE_*。
-    """
-    import threading
-    from queue import Queue as _Queue
-
+                  progress_cb=None) -> tuple[np.ndarray, np.ndarray]:
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     states = np.zeros(total, dtype=np.int8)
+    diffs = np.zeros(total, dtype=np.float32)
     n_workers = min(n_threads, multiprocessing.cpu_count())
     pw, ph = proc_res
-
-    # 预处理任务队列
-    preproc_q = _Queue(maxsize=batch_size * 2)
-
-    def _reader_and_preprocess():
-        """使用线程池并行处理 resize 和 cvtColor"""
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as tp:
-            idx = 0
-            futures = []
-            while True:
-                ret, frame = cap.read()
-                if not ret: break
-
-                # 提交预处理任务到线程池
-                def process(f, i):
-                    g = cv2.cvtColor(cv2.resize(f, (pw, ph), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
-                    return g, i
-
-                futures.append(tp.submit(process, frame, idx))
-                idx += 1
-
-                # 保持线程池和队列平衡，防止内存溢出
-                if len(futures) > 16:
-                    res = futures.pop(0).result()
-                    preproc_q.put(res)
-
-            # 清理剩余任务
-            for fut in futures:
-                preproc_q.put(fut.result())
-            preproc_q.put(None)
-
-    reader_thread = threading.Thread(target=_reader_and_preprocess, daemon=True)
-    reader_thread.start()
 
     with concurrent.futures.ProcessPoolExecutor(
             max_workers=n_workers,
             initializer=_worker_init,
             initargs=(configs, thresholds, proc_res)) as ex:
 
-        batch_grays, batch_indices = [], []
-        done = False
-        while not done:
-            while len(batch_grays) < batch_size:
-                item = preproc_q.get()
-                if item is None:
-                    done = True;
-                    break
-                gray, idx = item
-                batch_grays.append(gray);
+        idx = 0
+        prev_gray = None
+
+        while True:
+            batch_grays = []
+            batch_indices = []
+
+            for _ in range(batch_size):
+                ret, frame = cap.read()
+                if not ret: break
+
+                gray = cv2.cvtColor(cv2.resize(frame, (pw, ph), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+                batch_grays.append(gray)
                 batch_indices.append(idx)
 
-            if not batch_grays: break
+                if prev_gray is not None:
+                    diffs[idx] = float(cv2.mean(cv2.absdiff(gray, prev_gray))[0])
+                prev_gray = gray
+                idx += 1
 
-            # 使用较大的 chunksize 减少 IPC 往返
+            if not batch_grays:
+                break
+
             chunk = max(4, len(batch_grays) // (n_workers * 2))
             results = list(ex.map(_worker_classify_gray, batch_grays, chunksize=chunk))
 
-            for idx, s in zip(batch_indices, results):
-                states[idx] = s
-            if progress_cb: progress_cb(batch_indices[-1] / total)
-            batch_grays.clear();
-            batch_indices.clear()
+            for i, s in zip(batch_indices, results):
+                states[i] = s
 
-    reader_thread.join(timeout=5)
+            if progress_cb:
+                progress_cb((idx / total) * 0.5)
+
     cap.release()
-    return states
+    return states, diffs
 
 
 # ---------------------------------------------------------------
-#  段落提取 + DCT/Hist 差异检测
+#  段落提取 + 内部操作细粒度帧差分析 + 外部边界差分
 # ---------------------------------------------------------------
 
-def build_segments(states: np.ndarray, video_path: str, proc_res: tuple,
-                   compare_cfg: dict, progress_cb=None) -> tuple[list, list]:
-    """
-    根据帧状态数组生成 pause_segments / speed_segments。
-    compare_cfg: {'enabled', 'dct', 'hist', 'keep_n', 'keep_m'}
-    """
-    total  = len(states)
-    keep_n = compare_cfg['keep_n']
-    keep_m = compare_cfg['keep_m']
+def _analyze_pause_mask(s_i: int, e_i: int, diffs: np.ndarray, still_frames: int, motion_thresh: float):
+    seg_len = e_i - s_i + 1
+    if seg_len <= 0:
+        return np.zeros(0, dtype=np.uint8), 'all'
+
+    active_mask = np.zeros(seg_len, dtype=bool)
+    active_mask[0] = False
+
+    for k in range(1, seg_len):
+        idx = s_i + k
+        if diffs[idx] > motion_thresh:
+            active_mask[k] = True
+            active_mask[k - 1] = True
+
+    del_mask = np.zeros(seg_len, dtype=np.uint8)
+
+    if seg_len > 0:
+        runs = []
+        curr_val = active_mask[0]
+        start = 0
+        for i in range(1, seg_len):
+            if active_mask[i] != curr_val:
+                runs.append((curr_val, start, i - 1))
+                curr_val = active_mask[i]
+                start = i
+        runs.append((curr_val, start, seg_len - 1))
+
+        has_active = any(val for val, s, e in runs)
+
+        if not has_active:
+            if seg_len > 2 * still_frames:
+                del_mask[still_frames: seg_len - still_frames] = 1
+            return del_mask, 'auto'
+
+        for val, s, e in runs:
+            if not val:
+                run_len = e - s + 1
+                if run_len > still_frames:
+                    if s == 0:
+                        keep_start = e - still_frames + 1
+                        del_mask[s:keep_start] = 1
+                    elif e == seg_len - 1:
+                        keep_end = s + still_frames - 1
+                        del_mask[keep_end + 1:e + 1] = 1
+                    else:
+                        half = still_frames // 2
+                        other_half = still_frames - half
+                        del_mask[s + half: e - other_half + 1] = 1
+
+    return del_mask, 'auto'
+
+
+def build_segments(states: np.ndarray, diffs: np.ndarray, video_path: str, proc_res: tuple,
+                   compare_cfg: dict, fps: float, progress_cb=None) -> tuple[list, list]:
+    total = len(states)
     pauses = []
     speeds = []
 
-    cap = cv2.VideoCapture(video_path)
+    still_time = compare_cfg.get('still_time_thresh', 0.1)
+    motion_thresh = compare_cfg.get('motion_thresh', 2.0)
+    boundary_thresh = compare_cfg.get('boundary_thresh', 5.0)
+    still_frames = max(2, int(fps * still_time))
 
+    # 1. 基础分段
     i = 0
     while i < total:
         curr = int(states[i])
-        s_i  = i
+        s_i = i
         while i < total and int(states[i]) == curr:
             i += 1
-        e_i     = i - 1
-        seg_len = e_i - s_i + 1
+        e_i = i - 1
 
         if curr == FRAME_TYPE_PAUSE:
-            is_diff = True
-            dct_v = h_sim = 0.0
-
-            if compare_cfg['enabled']:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, s_i - 1))
-                _, f_b = cap.read()
-                cap.set(cv2.CAP_PROP_POS_FRAMES, min(total - 1, e_i + 1))
-                _, f_a = cap.read()
-
-                if f_b is not None and f_a is not None:
-                    g_b = cv2.cvtColor(cv2.resize(f_b, proc_res), cv2.COLOR_BGR2GRAY)
-                    g_a = cv2.cvtColor(cv2.resize(f_a, proc_res), cv2.COLOR_BGR2GRAY)
-
-                    dct_v = float(np.sum(np.abs(
-                        cv2.dct(np.float32(g_a))[:8, :8] -
-                        cv2.dct(np.float32(g_b))[:8, :8])))
-                    h_sim = float(cv2.compareHist(
-                        cv2.calcHist([g_b], [0], None, [256], [0, 256]),
-                        cv2.calcHist([g_a], [0], None, [256], [0, 256]),
-                        cv2.HISTCMP_CORREL))
-
-                    if dct_v < compare_cfg['dct'] and h_sim > compare_cfg['hist']:
-                        is_diff = False
-
-            if is_diff:
-                n = min(keep_n, seg_len)
-                m = min(keep_m, seg_len - n)
-                trim_in  = s_i + n
-                trim_out = e_i - m + 1
-                if trim_in > trim_out:
-                    trim_in = trim_out = s_i
-            else:
-                trim_in  = s_i
-                trim_out = e_i + 1
-
+            del_mask, mode = _analyze_pause_mask(s_i, e_i, diffs, still_frames, motion_thresh)
             pauses.append({
-                'id':       len(pauses),
-                'start':    s_i,
-                'end':      e_i,
-                'trim_in':  trim_in,
-                'trim_out': trim_out,
-                'dct':      dct_v,
-                'hist':     h_sim,
-                'is_diff':  is_diff,
+                'id': len(pauses),
+                'start': s_i,
+                'end': e_i,
+                'mode': mode,
+                'local_del_mask': del_mask,
+                'boundary_diff': 0.0  # 预占位，稍后计算
             })
+            if progress_cb: progress_cb(0.5 + (e_i / total) * 0.25)
 
         elif curr in (FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X):
             speeds.append({'type': curr, 'start': s_i, 'end': e_i})
 
-    cap.release()
+    # 2. 批量极速比对暂停边界差异
+    if pauses:
+        cap = cv2.VideoCapture(video_path)
+        # 获取所有目标帧索引，去重并排序
+        target_indices = sorted(list(set([max(0, p['start'] - 1) for p in pauses] +
+                                         [min(total - 1, p['end'] + 1) for p in pauses])))
+        target_frames = {}
+        curr_idx = 0
+        for target in target_indices:
+            # 顺序 grab 直到目标帧，这是最稳定精准读取特定帧的方法
+            while curr_idx < target:
+                cap.grab()
+                curr_idx += 1
+            ret, frame = cap.read()
+            if ret:
+                target_frames[target] = cv2.cvtColor(cv2.resize(frame, proc_res, interpolation=cv2.INTER_AREA),
+                                                     cv2.COLOR_BGR2GRAY)
+            curr_idx += 1
+        cap.release()
+
+        # 根据边界差分改写判定
+        for p in pauses:
+            b_idx = max(0, p['start'] - 1)
+            a_idx = min(total - 1, p['end'] + 1)
+            if b_idx in target_frames and a_idx in target_frames:
+                diff = float(cv2.mean(cv2.absdiff(target_frames[b_idx], target_frames[a_idx]))[0])
+                p['boundary_diff'] = diff
+                # 核心机制：一旦前后差距过小，不管之前算出来动作多大，一律强制“全删”
+                if diff < boundary_thresh:
+                    p['mode'] = 'all'
+
     return pauses, speeds
 
 
@@ -375,17 +309,16 @@ def build_segments(states: np.ndarray, video_path: str, proc_res: tuple,
 
 def _speedup_mask(states: np.ndarray, frame_type: int, factor: int,
                   exclude_mask: np.ndarray) -> np.ndarray:
-    total     = len(states)
+    total = len(states)
     type_mask = (states == frame_type) & ~exclude_mask
 
-    if not type_mask.any():
-        return np.zeros(total, dtype=bool)
+    if not type_mask.any(): return np.zeros(total, dtype=bool)
 
-    cumsum  = np.cumsum(type_mask)
+    cumsum = np.cumsum(type_mask)
     shifted = np.empty(total, dtype=bool)
-    shifted[0]  = False
+    shifted[0] = False
     shifted[1:] = type_mask[:-1]
-    seg_starts  = np.where(type_mask & ~shifted)[0]
+    seg_starts = np.where(type_mask & ~shifted)[0]
 
     offsets = np.zeros(total, dtype=np.int64)
     for s in seg_starts:
@@ -403,15 +336,18 @@ def build_delete_set(total: int, states: np.ndarray,
                      clip_segments: list,
                      speedup_1x: bool, speedup_02: bool,
                      speedup_02_factor: int) -> np.ndarray:
-    """计算需要删除的帧 bool mask（numpy，比 set 快 10-50x）"""
     del_mask = np.zeros(total, dtype=bool)
 
-    # 1. 暂停段裁剪区（删中间）
     for seg in pause_segments:
-        if seg['trim_out'] > seg['trim_in']:
-            del_mask[seg['trim_in']:seg['trim_out']] = True
+        s, e = seg['start'], seg['end']
+        mode = seg.get('mode', 'auto')
+        if mode == 'all':
+            del_mask[s:e + 1] = True
+        elif mode == 'auto' and 'local_del_mask' in seg:
+            m = seg['local_del_mask']
+            # 1 为自动删除，2 为人工强制删除
+            del_mask[s:e + 1] = (m == 1) | (m == 2)
 
-    # 2. 手动裁剪段（删两端，保中间；keep_in > keep_out 时全删）
     for seg in clip_segments:
         s, e = seg['start'], seg['end']
         ki, ko = seg['keep_in'], seg['keep_out']
@@ -421,234 +357,69 @@ def build_delete_set(total: int, states: np.ndarray,
             if ki > s:   del_mask[s:ki] = True
             if ko < e:   del_mask[ko + 1:e + 1] = True
 
-    # 3. 1x 变速抽帧
     if speedup_1x:
         del_mask |= _speedup_mask(states, FRAME_TYPE_1X, 2, del_mask)
 
-    # 4. 0.2x 变速抽帧
     if speedup_02 and speedup_02_factor > 1:
         del_mask |= _speedup_mask(states, FRAME_TYPE_0_2X, speedup_02_factor, del_mask)
 
     return del_mask
 
 
-# ---------------------------------------------------------------
-#  音频同步辅助
-# ---------------------------------------------------------------
-
-def _kept_intervals(to_del: np.ndarray, fps: float) -> list:
-    """将 to_del bool mask 转为 [(start_sec, end_sec), ...] 保留区间列表。"""
-    intervals = []
-    i = 0
-    total = len(to_del)
-    while i < total:
-        if not to_del[i]:
-            start = i
-            while i < total and not to_del[i]:
-                i += 1
-            end = i - 1
-            intervals.append((start / fps, (end + 1) / fps))
-        else:
-            i += 1
-    return intervals
-
-
-def _merge_audio(input_video: str, video_only_path: str,
-                 output_path: str, kept_intervals: list):
-    """
-    使用 FFmpeg concat demuxer 从原始视频提取多个音频段并拼接，
-    与 video_only_path 的视频混流到 output_path。
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        concat_file = os.path.join(tmpdir, "segments.txt")
-        with open(concat_file, "w") as f:
-            for start_sec, end_sec in kept_intervals:
-                f.write(f"file '{input_video}'\n")
-                f.write(f"inpoint {start_sec}\n")
-                f.write(f"outpoint {end_sec}\n")
-
-        audio_out = os.path.join(tmpdir, "audio.aac")
-
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-             "-i", concat_file, "-vn", "-c:a", "aac", "-threads", "0",
-             audio_out],
-            check=True, capture_output=True, timeout=600,
-            creationflags=_NO_WINDOW)
-
-        subprocess.run(
-            ["ffmpeg", "-y",
-             "-i", video_only_path,
-             "-i", audio_out,
-             "-c:v", "copy",
-             "-c:a", "copy",
-             "-map", "0:v:0",
-             "-map", "1:a:0",
-             "-shortest",
-             output_path],
-            check=True, capture_output=True, timeout=600,
-            creationflags=_NO_WINDOW)
-
-
-def _merge_audio_range(input_video: str, video_only_path: str,
-                       output_path: str, start_sec: float, end_sec: float):
-    """
-    单段连续区间：从原始视频提取 [start_sec, end_sec) 音频并与视频混流。
-    """
-    subprocess.run(
-        ["ffmpeg", "-y",
-         "-i", video_only_path,
-         "-ss", str(start_sec),
-         "-to", str(end_sec),
-         "-i", input_video,
-         "-c:v", "copy",
-         "-c:a", "aac", "-threads", "0",
-         "-map", "0:v:0",
-         "-map", "1:a:0",
-         "-shortest",
-         output_path],
-        check=True, capture_output=True, timeout=600,
-        creationflags=_NO_WINDOW)
-
-
-def export_video(video_path: str, output_path: str,to_del,
-                 fps: float, quality: int, progress_cb=None,use_gpu: bool = False):
-    """顺序读取并写入保留帧，再同步合并原始音频。"""
-    cap   = cv2.VideoCapture(video_path)
+def export_video(video_path: str, output_path: str, to_del,
+                 fps: float, quality: int, progress_cb=None, use_gpu: bool = False):
+    cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     if isinstance(to_del, set):
         mask = np.zeros(total, dtype=bool)
         for idx in to_del:
-            if 0 <= idx < total:
-                mask[idx] = True
+            if 0 <= idx < total: mask[idx] = True
         to_del = mask
 
     ret, sample = cap.read()
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    if not ret:
-        raise RuntimeError("无法读取视频帧")
+    if not ret: raise RuntimeError("无法读取视频帧")
     h, w = sample.shape[:2]
-
-    tmp_path = output_path + ".tmp.mp4"
 
     writer_kind = None
     ffmpeg_proc = None
     writer = None
 
     if shutil.which("ffmpeg"):
-        ffmpeg_proc = _open_ffmpeg_pipe_writer(
-            tmp_path, fps, w, h, quality, use_gpu=use_gpu)
+        ffmpeg_proc = _open_ffmpeg_pipe_writer(output_path, fps, w, h, quality, use_gpu=use_gpu)
         writer_kind = "ffmpeg"
     else:
         try:
             import imageio
-            writer = imageio.get_writer(tmp_path, fps=fps, codec='libx264',
+            writer = imageio.get_writer(output_path, fps=fps, codec='libx264',
                                         quality=quality, pixelformat='yuv420p')
             writer_kind = "imageio"
         except ImportError:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(tmp_path, fourcc, fps, (w, h))
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
             writer_kind = "cv2"
 
     written = 0
     try:
-        for idx in range(total):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if not to_del[idx]:
-                if writer_kind == "ffmpeg":
-                    ffmpeg_proc.stdin.write(frame.tobytes())
-                elif writer_kind == "imageio":
-                    writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        idx = 0
+        while idx < total:
+            if to_del[idx]:
+                next_keep = idx + 1
+                while next_keep < total and to_del[next_keep]:
+                    next_keep += 1
+                gap = next_keep - idx
+                if gap > 30:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, next_keep)
                 else:
-                    writer.write(frame)
-                written += 1
-            if progress_cb and idx % 60 == 0:
-                progress_cb(idx / total, written)
-    finally:
-        _close_video_writer(writer_kind, writer, ffmpeg_proc)
+                    for _ in range(gap):
+                        cap.read()
+                idx = next_keep
+                continue
 
-    cap.release()
-
-    # 音频同步：将原始音频按保留帧区间裁剪后混流
-    if written > 0 and shutil.which("ffmpeg"):
-        try:
-            intervals = _kept_intervals(to_del, fps)
-            if intervals:
-                _merge_audio(video_path, tmp_path, output_path, intervals)
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            else:
-                shutil.move(tmp_path, output_path)
-        except Exception:
-            if os.path.exists(output_path):
-                os.remove(output_path)
-            shutil.move(tmp_path, output_path)
-    else:
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        if written > 0:
-            shutil.move(tmp_path, output_path)
-        elif os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-    return written, total
-
-
-def export_frame_range(video_path: str, output_path: str,start_frame: int, end_frame: int,
-                       fps: float, quality: int, progress_cb=None,use_gpu: bool = False):
-    """导出闭区间 [start_frame, end_frame] 的视频（同步合并音频）"""
-    cap = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total <= 0:
-        cap.release()
-        raise RuntimeError("无法读取视频帧")
-
-    s = max(0, min(start_frame, total - 1))
-    e = max(0, min(end_frame, total - 1))
-    if e < s:
-        cap.release()
-        raise RuntimeError("分段范围无效")
-
-    cap.set(cv2.CAP_PROP_POS_FRAMES, s)
-
-    ret, sample = cap.read()
-    cap.set(cv2.CAP_PROP_POS_FRAMES, s)
-    if not ret:
-        cap.release()
-        raise RuntimeError("无法读取视频帧")
-    h, w = sample.shape[:2]
-
-    tmp_path = output_path + ".tmp.mp4"
-
-    writer_kind = None
-    ffmpeg_proc = None
-    writer = None
-
-    if shutil.which("ffmpeg"):
-        ffmpeg_proc = _open_ffmpeg_pipe_writer(
-            tmp_path, fps, w, h, quality, use_gpu=use_gpu)
-        writer_kind = "ffmpeg"
-    else:
-        try:
-            import imageio
-            writer = imageio.get_writer(tmp_path, fps=fps, codec='libx264',
-                                        quality=quality, pixelformat='yuv420p')
-            writer_kind = "imageio"
-        except ImportError:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(tmp_path, fourcc, fps, (w, h))
-            writer_kind = "cv2"
-
-    seg_len = e - s + 1
-    written = 0
-    try:
-        for i in range(seg_len):
             ret, frame = cap.read()
-            if not ret:
-                break
+            if not ret: break
+
             if writer_kind == "ffmpeg":
                 ffmpeg_proc.stdin.write(frame.tobytes())
             elif writer_kind == "imageio":
@@ -656,34 +427,109 @@ def export_frame_range(video_path: str, output_path: str,start_frame: int, end_f
             else:
                 writer.write(frame)
             written += 1
-            if progress_cb and i % 30 == 0:
-                progress_cb((i + 1) / seg_len, written)
+            idx += 1
+
+            if progress_cb and written % 60 == 0:
+                progress_cb(idx / total, written)
     finally:
         _close_video_writer(writer_kind, writer, ffmpeg_proc)
 
     cap.release()
+    return written, total
 
-    # 音频同步：单段连续区间直接用 -ss / -to 提取并混流
-    if written > 0 and shutil.which("ffmpeg"):
+
+def export_ranges(video_path: str, output_path: str, ranges: list,
+                  fps: float, quality: int, progress_cb=None, use_gpu: bool = False):
+    if not ranges:
+        return 0, 0
+
+    if len(ranges) == 1 and shutil.which("ffmpeg"):
+        s, e = ranges[0]
+        frames = e - s + 1
+        start_sec = s / fps
+        q = max(0, min(10, int(quality)))
+        crf = int(round(28 - q))
+
+        cmd = ["ffmpeg", "-y", "-ss", f"{start_sec:.4f}", "-i", video_path, "-frames:v", str(frames)]
+
+        enc = _pick_gpu_encoder() if use_gpu else None
+        if enc == "h264_nvenc":
+            cmd += ["-c:v", enc, "-preset", "p4", "-cq", str(18 + (10 - q))]
+        elif enc == "h264_qsv":
+            cmd += ["-c:v", enc, "-global_quality", str(18 + (10 - q))]
+        elif enc:
+            cmd += ["-c:v", enc, "-q:v", str(18 + (10 - q))]
+        else:
+            cmd += ["-c:v", "libx264", "-crf", str(crf)]
+
+        cmd += ["-an", "-pix_fmt", "yuv420p", output_path]
+
         try:
-            start_sec = s / fps
-            end_sec   = (e + 1) / fps
-            _merge_audio_range(video_path, tmp_path, output_path, start_sec, end_sec)
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            if os.path.exists(output_path):
-                os.remove(output_path)
-            shutil.move(tmp_path, output_path)
-    else:
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        if written > 0:
-            shutil.move(tmp_path, output_path)
-        elif os.path.exists(tmp_path):
-            os.remove(tmp_path)
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if progress_cb: progress_cb(1.0, frames)
+            return frames, frames
+        except subprocess.CalledProcessError:
+            pass
 
-    return written, seg_len
+    cap = cv2.VideoCapture(video_path)
+    total_frames_to_export = sum(e - s + 1 for s, e in ranges)
+    if total_frames_to_export <= 0:
+        cap.release()
+        return 0, 0
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, ranges[0][0])
+    ret, sample = cap.read()
+    if not ret:
+        cap.release()
+        raise RuntimeError("无法读取视频帧")
+    h, w = sample.shape[:2]
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, ranges[0][0])
+
+    writer_kind = None
+    ffmpeg_proc = None
+    writer = None
+
+    if shutil.which("ffmpeg"):
+        ffmpeg_proc = _open_ffmpeg_pipe_writer(output_path, fps, w, h, quality, use_gpu=use_gpu)
+        writer_kind = "ffmpeg"
+    else:
+        try:
+            import imageio
+            writer = imageio.get_writer(output_path, fps=fps, codec='libx264',
+                                        quality=quality, pixelformat='yuv420p')
+            writer_kind = "imageio"
+        except ImportError:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+            writer_kind = "cv2"
+
+    written = 0
+    try:
+        for s, e in ranges:
+            cur_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            if cur_pos != s:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, s)
+
+            for i in range(s, e + 1):
+                ret, frame = cap.read()
+                if not ret: break
+
+                if writer_kind == "ffmpeg":
+                    ffmpeg_proc.stdin.write(frame.tobytes())
+                elif writer_kind == "imageio":
+                    writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                else:
+                    writer.write(frame)
+
+                written += 1
+                if progress_cb and written % 30 == 0:
+                    progress_cb(written / total_frames_to_export, written)
+    finally:
+        _close_video_writer(writer_kind, writer, ffmpeg_proc)
+
+    cap.release()
+    return written, total_frames_to_export
 
 
 def _pick_gpu_encoder() -> str | None:
@@ -694,51 +540,33 @@ def _pick_gpu_encoder() -> str | None:
     except Exception:
         return None
 
-    candidates = [
-        "h264_nvenc",
-        "h264_qsv",
-        "h264_amf",
-        "h264_videotoolbox",
-    ]
+    candidates = ["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox"]
     for enc in candidates:
-        if enc in out:
-            return enc
+        if enc in out: return enc
     return None
 
 
-def _open_ffmpeg_pipe_writer(output_path: str, fps: float, w: int, h: int,
-                             quality: int, use_gpu: bool):
+def _open_ffmpeg_pipe_writer(output_path: str, fps: float, w: int, h: int, quality: int, use_gpu: bool):
     q = max(0, min(10, int(quality)))
     crf = int(round(28 - q))
     base_cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-pix_fmt", "bgr24",
-        "-s", f"{w}x{h}",
-        "-r", f"{fps}",
-        "-i", "-",
-        "-an",
+        "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{w}x{h}", "-r", f"{fps}", "-i", "-", "-an",
     ]
 
     if use_gpu:
         enc = _pick_gpu_encoder()
         if enc:
             if enc == "h264_nvenc":
-                cmd = base_cmd + ["-c:v", enc, "-preset", "p4", "-cq", str(18 + (10 - q)),
-                                  "-threads", "0", output_path]
+                cmd = base_cmd + ["-c:v", enc, "-preset", "p4", "-cq", str(18 + (10 - q)), output_path]
             elif enc == "h264_qsv":
-                cmd = base_cmd + ["-c:v", enc, "-global_quality", str(18 + (10 - q)),
-                                  "-threads", "0", output_path]
+                cmd = base_cmd + ["-c:v", enc, "-global_quality", str(18 + (10 - q)), output_path]
             else:
-                cmd = base_cmd + ["-c:v", enc, "-q:v", str(18 + (10 - q)),
-                                  "-threads", "0", output_path]
-            return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    creationflags=_NO_WINDOW)
+                cmd = base_cmd + ["-c:v", enc, "-q:v", str(18 + (10 - q)), output_path]
+            return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    cmd = base_cmd + ["-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p",
-                      "-threads", "0", output_path]
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
-                            creationflags=_NO_WINDOW)
+    cmd = base_cmd + ["-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", output_path]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 def _close_video_writer(writer_kind, writer, ffmpeg_proc):

@@ -1,7 +1,4 @@
 # preview_player.py — 视频预览播放器
-# 职责：UI 组装、视频加载/播放控制、模板分析、导出
-# 时间轴绘制/交互 → timeline_widget.TimelineWidget
-# 视频 IO 线程     → video_io.VideoIOThread
 
 import tkinter as tk
 from tkinter import ttk
@@ -13,6 +10,7 @@ import threading
 import subprocess
 import shutil
 import os
+import concurrent.futures
 from queue import Queue, Empty
 
 from frame_types import (FRAME_TYPE_NORMAL, FRAME_TYPE_PAUSE,
@@ -22,78 +20,57 @@ from timeline_widget import TimelineWidget
 
 
 class VideoPreviewPlayer(tk.Frame):
-    """
-    视频预览播放器主 Widget。
-    布局：
-      ┌─────────────────────┐
-      │   video_canvas      │  ← BGR 帧显示
-      ├─────────────────────┤
-      │   TimelineWidget    │  ← 时间轴（独立组件）
-      ├─────────────────────┤
-      │   控制栏             │
-      ├─────────────────────┤
-      │   状态栏             │
-      └─────────────────────┘
-    """
-
     def __init__(self, parent, settings, video_path=None, width=800, height=450):
         super().__init__(parent)
-        self.settings   = settings
+        self.settings = settings
         self.video_path = video_path
 
-        self.total_frames: int   = 0
-        self.fps:          float = 30.0
+        self.total_frames: int = 0
+        self.fps: float = 30.0
         self.current_frame_idx: int = 0
 
         self.canvas_w = width
         self.canvas_h = height
 
         self.pause_segments: list = []
-        self.speed_segments:  list = []
-        self.clip_segments:   list = []   # 手动裁剪段（删两端保中间）
-        self.states_array         = None
+        self.speed_segments: list = []
+        self.clip_segments: list = []
+        self.states_array = None
+        self.diffs_array = None  # 新增：持久化保存帧差异，用于随时根据新参数重算裁剪区
 
         self.is_playing = False
         self._io: VideoIOThread | None = None
         self._frame_q: Queue = Queue(maxsize=2)
         self._canvas_img_id = None
-        self._audio_proc = None
-        self.preview_audio_var = tk.BooleanVar(value=True)
 
-        # 键盘连续移动状态
-        self._key_held:       str | None = None
-        self._key_after_id:   str | None = None
-        self._key_hold_fired: bool       = False
+        self._key_held: str | None = None
+        self._key_after_id: str | None = None
+        self._key_hold_fired: bool = False
         self._key_preview_id: str | None = None
-        # 鼠标拖动红条状态：拖动期间不让旧帧覆盖 current_frame_idx
-        self._is_dragging:    bool       = False
+        self._is_dragging: bool = False
 
         self._setup_ui()
-        if video_path:
-            self.load_video(video_path)
+        if video_path: self.load_video(video_path)
+
+        # 绑定单段与批量事件
+        self.settings.apply_pause_callback = self.apply_pause_mode
+        self.settings.single_pause_callback = self.set_single_pause_mode
+        self.timeline.on_pause_select_cb = self._on_timeline_pause_select
 
     # ==========================================================
     #  UI 构建
     # ==========================================================
     def _setup_ui(self):
-        # 视频画布
-        self.video_canvas = tk.Canvas(self, width=self.canvas_w,
-                                      height=self.canvas_h, bg="black")
+        self.video_canvas = tk.Canvas(self, width=self.canvas_w, height=self.canvas_h, bg="black")
         self.video_canvas.pack(pady=5, fill=tk.BOTH, expand=True)
-        self.video_canvas.bind("<Configure>", self._on_canvas_resize)
-        self.video_canvas.bind("<Button-1>",
-                               lambda e: self.video_canvas.focus_set())
+        self.video_canvas.bind("<Button-1>", lambda e: self.video_canvas.focus_set())
 
-        # 时间轴组件
         self.timeline = TimelineWidget(self)
         self.timeline.pack(fill=tk.X, padx=10)
-        self.timeline.on_seek_cb       = self._on_tl_seek
+        self.timeline.on_seek_cb = self._on_tl_seek
         self.timeline.on_handle_end_cb = self._on_tl_drag_end
-        # 点击时间轴时把焦点移离输入控件
-        self.timeline.canvas.bind("<Button-1>",
-            lambda e: self.video_canvas.focus_set(), add='+')
+        self.timeline.canvas.bind("<Button-1>", lambda e: self.video_canvas.focus_set(), add='+')
 
-        # 控制栏
         ctrl = ttk.Frame(self)
         ctrl.pack(fill=tk.X, pady=5)
 
@@ -101,52 +78,34 @@ class VideoPreviewPlayer(tk.Frame):
         self.btn_play.pack(side=tk.LEFT, padx=5)
 
         ttk.Label(ctrl, text="倍速:").pack(side=tk.LEFT, padx=(10, 2))
-        # < 1x 靠拉长帧间隔实现慢放；≥ 1x 靠抽帧实现加速
         self.preview_speed_var = tk.StringVar(value="1x")
         speed_combo = ttk.Combobox(
-            ctrl,
-            textvariable=self.preview_speed_var,
-            values=["0.1x", "0.25x", "0.5x", "1x", "2x", "4x"],
-            width=6, state="readonly")
+            ctrl, textvariable=self.preview_speed_var,
+            values=["0.1x", "0.25x", "0.5x", "1x", "2x", "4x"], width=6, state="readonly")
         speed_combo.pack(side=tk.LEFT, padx=2)
 
-        self.btn_analyze = ttk.Button(ctrl, text="自动模板分析",
-                                      command=self._start_analysis)
+        self.btn_analyze = ttk.Button(ctrl, text="自动模板分析", command=self._start_analysis)
         self.btn_analyze.pack(side=tk.LEFT, padx=10)
 
         self.skip_trimmed = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ctrl, text="预览时跳过裁剪区",
-                        variable=self.skip_trimmed).pack(side=tk.LEFT, padx=5)
-
-        ttk.Checkbutton(ctrl, text="音频预览",
-                        variable=self.preview_audio_var).pack(side=tk.LEFT, padx=2)
-        self.preview_audio_var.trace_add('write', self._on_audio_toggle)
+        ttk.Checkbutton(ctrl, text="预览时跳过裁剪区", variable=self.skip_trimmed).pack(side=tk.LEFT, padx=5)
 
         self.lbl_time = ttk.Label(ctrl, text="00:00 / 00:00")
         self.lbl_time.pack(side=tk.RIGHT, padx=10)
 
-        # 状态栏
-        self.lbl_info = ttk.Label(self, text="就绪",
-                                  foreground="#00CED1", font=("黑体", 10))
+        self.lbl_info = ttk.Label(self, text="就绪", foreground="#00CED1", font=("Consolas", 10))
         self.lbl_info.pack(fill=tk.X, padx=10, pady=2)
 
-        # 操作提示
-        hint = ("← → 逐帧/连续移动  |  空格 播放/暂停  |  "
-                "连续移动速度可在「基本」设置里调整")
-        ttk.Label(self, text=hint, foreground="#555555",
-                  font=("黑体", 8)).pack(fill=tk.X, padx=10, pady=(0, 2))
+        hint = "← → 逐帧移动  |  空格 播放  |  时间轴：右键点击黄色块手动删除操作，鼠标中键平移"
+        ttk.Label(self, text=hint, foreground="#555555", font=("Consolas", 8)).pack(fill=tk.X, padx=10, pady=(0, 2))
 
         self._render_loop()
-
-        # 键盘事件绑定到顶层窗口（避免焦点问题）
-        # 使用 after_idle 等 UI 完全初始化后再绑定
         self.after_idle(self._bind_keys)
 
     # ==========================================================
     #  视频加载
     # ==========================================================
     def load_video(self, path: str):
-        self._stop_audio()
         if self._io and self._io.is_alive():
             self._io.stop_and_quit()
             self._io = None
@@ -164,31 +123,31 @@ class VideoPreviewPlayer(tk.Frame):
         self.speed_segments.clear()
         self.clip_segments.clear()
         self.states_array = None
-        self.is_playing   = False
+        self.diffs_array = None
+        self.is_playing = False
         self.btn_play.config(text="▶ 播放")
         self._canvas_img_id = None
+        self.timeline.selected_pause_id = None
+        self.settings.set_selected_pause(None, "")
 
-        # 启动新 IO 线程
         self._io = VideoIOThread(path, self._frame_q)
         self._io.start()
-        self.fps          = self._io.fps
+        self.fps = self._io.fps
         self.total_frames = self._io.total
 
-        # 同步到时间轴
-        self.timeline.total_frames  = self.total_frames
-        self.timeline.fps           = self.fps
-        self.timeline.zoom_level    = 1.0
+        self.timeline.total_frames = self.total_frames
+        self.timeline.fps = self.fps
+        self.timeline.zoom_level = 1.0
         self.timeline.scroll_offset = 0.0
         self.timeline.pause_segments = self.pause_segments
-        self.timeline.speed_segments  = self.speed_segments
-        self.timeline.clip_segments   = self.clip_segments
+        self.timeline.speed_segments = self.speed_segments
+        self.timeline.clip_segments = self.clip_segments
         self.timeline.current_frame_idx = 0
         self.timeline.mark_dirty()
 
-        if not self.settings.output_var.get():
-            import os
-            name, _ = os.path.splitext(path)
-            self.settings.output_var.set(f"{name}_clipped.mp4")
+        # 移除原先的 if not 判断，强制更新导出路径
+        name, _ = os.path.splitext(path)
+        self.settings.output_var.set(f"{name}_clipped.mp4")
 
         self._seek(0)
         self.timeline.redraw()
@@ -197,371 +156,223 @@ class VideoPreviewPlayer(tk.Frame):
     #  IO 线程命令封装
     # ==========================================================
     def _canvas_wh(self) -> tuple:
-        cw = self.video_canvas.winfo_width()  or self.canvas_w
+        cw = self.video_canvas.winfo_width() or self.canvas_w
         ch = self.video_canvas.winfo_height() or self.canvas_h
         return (max(1, cw), max(1, ch))
-
-    def _pause_segs_snap(self) -> list:
-        return [(s['trim_in'], s['trim_out']) for s in self.pause_segments]
 
     def _speed_segs_snap(self) -> list:
         return [(s['start'], s['end'], s['type']) for s in self.speed_segments]
 
     def _all_skip_segs_snap(self) -> list:
-        """
-        合并所有需要预览跳过的区间：
-          - pause 段的裁剪区 [trim_in, trim_out)
-          - clip  段的两端删除区 [start, keep_in) 和 (keep_out, end]
-        IO 线程的 jump_pause 对两种区间的处理完全一样。
-        """
         segs = []
         for s in self.pause_segments:
-            if s['trim_out'] > s['trim_in']:
-                segs.append((s['trim_in'], s['trim_out']))
+            mode = s.get('mode', 'auto')
+            start = s['start']
+            if mode == 'all':
+                segs.append((start, s['end'] + 1))
+            elif mode == 'auto' and 'local_del_mask' in s:
+                mask = s['local_del_mask']
+                is_del = False
+                del_start = 0
+                for i in range(len(mask)):
+                    delete_this = (mask[i] == 1 or mask[i] == 2)
+                    if delete_this and not is_del:
+                        is_del = True
+                        del_start = start + i
+                    elif not delete_this and is_del:
+                        is_del = False
+                        segs.append((del_start, start + i))
+                if is_del:
+                    segs.append((del_start, start + len(mask)))
+
         for s in self.clip_segments:
             ki, ko = s['keep_in'], s['keep_out']
             if ki > ko:
-                # 全删
                 segs.append((s['start'], s['end'] + 1))
             else:
-                if ki > s['start']:
-                    segs.append((s['start'], ki))
-                if ko < s['end']:
-                    segs.append((ko + 1, s['end'] + 1))
+                if ki > s['start']: segs.append((s['start'], ki))
+                if ko < s['end']: segs.append((ko + 1, s['end'] + 1))
         return segs
 
     def _seek(self, frame_idx: int, skip_trim: bool = False):
-        """发送节流 seek 命令（不影响播放状态）"""
-        if not self._io:
-            return
+        if not self._io: return
         self.current_frame_idx = frame_idx
         self.timeline.current_frame_idx = frame_idx
         self._io.send({
-            'type':         CMD_SEEK_LATEST,
-            'frame':        frame_idx,
-            'canvas_wh':    self._canvas_wh(),
-            'pause_segs':   self._all_skip_segs_snap(),
+            'type': CMD_SEEK_LATEST,
+            'frame': frame_idx,
+            'canvas_wh': self._canvas_wh(),
+            'pause_segs': self._all_skip_segs_snap(),
             'skip_trimmed': skip_trim,
         })
 
     def _send_play(self, start: int):
-        if not self._io:
-            return
-        # 解析倍速字符串
+        if not self._io: return
+        p = self.settings.get_params()
+
         speed_str = self.preview_speed_var.get().rstrip('x')
         try:
             speed = float(speed_str)
         except ValueError:
             speed = 1.0
-        self._start_audio(start, speed)
-        p = self.settings.get_params()
-
         if speed >= 1.0:
-            preview_step       = max(1, int(speed))
-            speed_multiplier   = 1.0
+            preview_step = max(1, int(speed))
+            speed_multiplier = 1.0
         else:
-            preview_step       = 1
-            speed_multiplier   = 1.0 / max(speed, 0.01)   # e.g. 0.25x → ×4帧间隔
+            preview_step = 1
+            speed_multiplier = 1.0 / max(speed, 0.01)
 
         self._io.send({
             'type': CMD_PLAY,
             'params': {
-                'start_frame':       start,
-                'preview_step':      preview_step,
-                'speed_multiplier':  speed_multiplier,
-                'skip_trimmed':      self.skip_trimmed.get(),
-                'speedup_1x':        p['speedup_1x'],
-                'speedup_02':        p['speedup_02'],
+                'start_frame': start,
+                'preview_step': preview_step,
+                'speed_multiplier': speed_multiplier,
+                'skip_trimmed': self.skip_trimmed.get(),
+                'speedup_1x': p['speedup_1x'],
+                'speedup_02': p['speedup_02'],
                 'speedup_02_factor': p['speedup_02_factor'],
-                'pause_segs':        self._all_skip_segs_snap(),
-                'speed_segs':        self._speed_segs_snap(),
-                'canvas_wh':         self._canvas_wh(),
+                'pause_segs': self._all_skip_segs_snap(),
+                'speed_segs': self._speed_segs_snap(),
+                'canvas_wh': self._canvas_wh(),
             }
         })
 
     def _send_stop(self):
-        if self._io:
-            self._io.send({'type': CMD_STOP})
-        self._stop_audio()
-
-    # ==========================================================
-    #  音频预览
-    # ==========================================================
-
-    @staticmethod
-    def _build_atempo_filter(speed: float) -> str:
-        """构建 atempo 滤镜链，将音频变速至目标倍速。
-        atempo 单次范围 [0.5, 2.0]，超出范围时连锁多个滤镜。"""
-        if speed == 1.0:
-            return ""
-        remaining = speed
-        parts = []
-        while remaining >= 2.0:
-            parts.append("atempo=2.0")
-            remaining /= 2.0
-        while remaining <= 0.5:
-            parts.append("atempo=0.5")
-            remaining /= 0.5
-        if 0.5 < remaining < 2.0 and abs(remaining - 1.0) > 0.001:
-            parts.append(f"atempo={remaining:.3f}")
-        return ",".join(parts)
-
-    def _build_audio_keep_intervals(self, start_frame: int) -> list:
-        """从跳过区间反算出需要保留的音频时间区间 [si,ei)/fps。"""
-        skip_segs = self._all_skip_segs_snap()
-        total_time = self.total_frames / self.fps if self.fps else 0
-        skip_times = sorted(
-            (s / self.fps, min(e, self.total_frames) / self.fps)
-            for s, e in skip_segs if e > s and s < self.total_frames)
-        if not skip_times:
-            return [(start_frame / self.fps, total_time)]
-        keeps = []
-        cur = start_frame / self.fps
-        for ss, se in skip_times:
-            if ss > cur:
-                keeps.append((cur, min(ss, total_time)))
-            cur = max(cur, se)
-        if cur < total_time:
-            keeps.append((cur, total_time))
-        return keeps
-
-    def _start_audio(self, start_frame: int, speed: float = 1.0):
-        self._stop_audio()
-        if not self.video_path or not self.preview_audio_var.get():
-            return
-        if not self.fps:
-            return
-
-        atempo = self._build_atempo_filter(speed)
-        filter_parts = []
-
-        if self.skip_trimmed.get():
-            intervals = self._build_audio_keep_intervals(start_frame)
-            if intervals:
-                expr = "+".join(
-                    f"between(t,{s:.3f},{e:.3f})" for s, e in intervals)
-                filter_parts.append(f"aselect='{expr}',asetpts=N/SR/TB")
-
-        filter_parts.append("volume=0.3")
-        if atempo:
-            filter_parts.append(atempo)
-        audio_filter = ",".join(filter_parts)
-
-        try:
-            self._audio_proc = subprocess.Popen(
-                ["ffplay", "-nodisp", "-autoexit",
-                 "-i", self.video_path, "-loglevel", "quiet",
-                 "-af", audio_filter],
-                stdin=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-        except Exception:
-            self._audio_proc = None
-
-    def _stop_audio(self):
-        proc, self._audio_proc = self._audio_proc, None
-        if proc:
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.terminate()
-                proc.wait(timeout=1)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-    def _on_audio_toggle(self, *args):
-        if self.preview_audio_var.get():
-            if self.is_playing:
-                speed_str = self.preview_speed_var.get().rstrip('x')
-                try:
-                    speed = float(speed_str)
-                except ValueError:
-                    speed = 1.0
-                self._start_audio(self.current_frame_idx, speed)
-        else:
-            self._stop_audio()
+        if self._io: self._io.send({'type': CMD_STOP})
 
     # ==========================================================
     #  键盘快捷键
     # ==========================================================
 
-    # 连续移动期间的预览刷新间隔（ms）
     _KEY_PREVIEW_MS = 150
 
     def _bind_keys(self):
         root = self.winfo_toplevel()
-        root.bind('<Left>',              self._on_key_press_left,  add='+')
-        root.bind('<Right>',             self._on_key_press_right, add='+')
-        root.bind('<KeyRelease-Left>',   self._on_key_release,     add='+')
-        root.bind('<KeyRelease-Right>',  self._on_key_release,     add='+')
-        # 空格统一由我们处理，阻止按钮等控件自己响应
+        root.bind('<Left>', self._on_key_press_left, add='+')
+        root.bind('<Right>', self._on_key_press_right, add='+')
+        root.bind('<KeyRelease-Left>', self._on_key_release, add='+')
+        root.bind('<KeyRelease-Right>', self._on_key_release, add='+')
         root.bind('<space>', self._on_key_space)
-        for cls in ('TButton', 'Button', 'TCheckbutton', 'TRadiobutton',
-                    'TCombobox', 'TNotebook'):
+        for cls in ('TButton', 'Button', 'TCheckbutton', 'TRadiobutton', 'TCombobox', 'TNotebook'):
             root.bind_class(cls, '<space>', lambda e: 'break')
 
     def _on_key_press_left(self, event):
-        if self._key_held == 'Left':
-            return
-        self._key_held       = 'Left'
+        if self._key_held == 'Left': return
+        self._key_held = 'Left'
         self._key_hold_fired = False
-        self._step_frame(-1, seek=True)   # 单步：立即 seek 显示画面
+        self._step_frame(-1, seek=True)
         self._key_after_id = self.after(400, self._start_repeat, 'Left')
 
     def _on_key_press_right(self, event):
-        if self._key_held == 'Right':
-            return
-        self._key_held       = 'Right'
+        if self._key_held == 'Right': return
+        self._key_held = 'Right'
         self._key_hold_fired = False
         self._step_frame(+1, seek=True)
         self._key_after_id = self.after(400, self._start_repeat, 'Right')
 
     def _on_key_release(self, event):
         direction = event.keysym
-        if self._key_held != direction:
-            return
+        if self._key_held != direction: return
         self._key_held = None
-        # 取消移动循环
         if self._key_after_id:
             self.after_cancel(self._key_after_id)
             self._key_after_id = None
-        # 取消预览循环
         if self._key_preview_id:
             self.after_cancel(self._key_preview_id)
             self._key_preview_id = None
         if self._key_hold_fired:
-            # flush 掉 frame_q 里旧帧（_preview_tick 积压的），
-            # 避免松手后旧帧覆盖 current_frame_idx 导致位置错误
             while True:
                 try:
                     self._frame_q.get_nowait()
                 except Empty:
                     break
-            self._do_preview_seek()   # 补发最终位置的 seek
-        self._key_hold_fired = False  # 重置后 _render_loop 恢复正常更新
+            self._do_preview_seek()
+        self._key_hold_fired = False
 
     def _on_key_space(self, event):
-        # 焦点在输入类控件时放行（用户在打字/输入数字），其余情况空格=播放/暂停
         focused = self.focus_get()
-        if isinstance(focused, (ttk.Entry, ttk.Spinbox, tk.Entry, ttk.Combobox)):
-            return
-        self.toggle_play()
+        if isinstance(focused, (ttk.Entry, tk.Entry, ttk.Combobox)): return
+        self.toggle_play();
         return 'break'
 
     def _start_repeat(self, direction: str):
-        """长按 400ms 后进入连续移动阶段，同时启动预览刷新定时器"""
         self._key_hold_fired = True
-        # 启动预览刷新循环（独立于移动循环，固定 150ms 一次）
         self._schedule_preview()
         self._repeat_frame(direction)
 
     def _repeat_frame(self, direction: str):
-        """
-        连续移动循环：只更新 current_frame_idx 和时间轴红条，
-        不发 seek（避免每帧解码，IO 线程压力大且画面闪烁）。
-        画面刷新由独立的 _preview_tick 定时器负责。
-        """
-        if self._key_held != direction:
-            return
+        if self._key_held != direction: return
         delta = -1 if direction == 'Left' else +1
-        self._step_frame(delta, seek=False)   # 只动指针，不 seek
-        speed    = self.settings.key_repeat_speed_var.get()
+        self._step_frame(delta, seek=False)
+        speed = self.settings.key_repeat_speed_var.get()
         interval = max(16, int(1000 / speed))
         self._key_after_id = self.after(interval, self._repeat_frame, direction)
 
     def _schedule_preview(self):
-        """启动预览刷新定时器"""
-        self._key_preview_id = self.after(
-            self._KEY_PREVIEW_MS, self._preview_tick)
+        self._key_preview_id = self.after(self._KEY_PREVIEW_MS, self._preview_tick)
 
     def _preview_tick(self):
-        """定期发一次 seek 显示当前位置的画面"""
-        if not self._key_held:
-            return
+        if not self._key_held: return
         self._do_preview_seek()
-        self._key_preview_id = self.after(
-            self._KEY_PREVIEW_MS, self._preview_tick)
+        self._key_preview_id = self.after(self._KEY_PREVIEW_MS, self._preview_tick)
 
     def _do_preview_seek(self):
-        """向 IO 线程发送节流 seek，显示当前帧画面"""
-        if not self._io or self.total_frames <= 0:
-            return
-        idx = self.current_frame_idx
+        if not self._io or self.total_frames <= 0: return
         self._io.send({
-            'type':         CMD_SEEK_LATEST,
-            'frame':        idx,
-            'canvas_wh':    self._canvas_wh(),
-            'pause_segs':   [],        # 连续移动时不跳裁剪区，显示原始画面
+            'type': CMD_SEEK_LATEST,
+            'frame': self.current_frame_idx,
+            'canvas_wh': self._canvas_wh(),
+            'pause_segs': [],
             'skip_trimmed': False,
         })
 
     def _step_frame(self, delta: int, seek: bool = True):
-        """
-        移动若干帧。
-        seek=True：同时发 CMD_SEEK_LATEST 刷新画面（单步用）
-        seek=False：只更新索引和时间轴红条（连续移动用，画面由预览定时器刷新）
-        """
-        if self.total_frames <= 0:
-            return
-        new_idx = max(0, min(self.total_frames - 1,
-                             self.current_frame_idx + delta))
-        if new_idx == self.current_frame_idx:
-            return
+        if self.total_frames <= 0: return
+        new_idx = max(0, min(self.total_frames - 1, self.current_frame_idx + delta))
+        if new_idx == self.current_frame_idx: return
         self.current_frame_idx = new_idx
         self.timeline.current_frame_idx = new_idx
         self.timeline._ensure_pointer_visible()
         self.timeline.update_pointer()
         self._update_labels()
-        if seek:
-            self._seek(new_idx, skip_trim=False)
+        if seek: self._seek(new_idx, skip_trim=False)
 
     # ==========================================================
     #  播放控制
     # ==========================================================
     def toggle_play(self):
         if self.is_playing:
-            self.is_playing = False
+            self.is_playing = False;
             self.btn_play.config(text="▶ 播放")
             self._send_stop()
         else:
-            self.is_playing = True
+            self.is_playing = True;
             self.btn_play.config(text="⏸ 暂停")
             self._send_play(self.current_frame_idx)
 
-    # ==========================================================
-    #  时间轴回调
-    # ==========================================================
     def _on_tl_seek(self, frame_idx: int):
-        """时间轴点击/拖动红条 → seek（不跳过裁剪区）"""
         self._is_dragging = True
         self._seek(frame_idx, skip_trim=False)
 
     def _on_tl_drag_end(self):
-        """红条松手：flush 旧帧，确保 current_frame_idx 不被旧帧覆盖"""
         self._is_dragging = False
-        # 清空队列里可能残留的旧帧，避免覆盖刚设好的位置
         while True:
             try:
                 self._frame_q.get_nowait()
             except Empty:
                 break
-        if self.is_playing:
-            self._send_play(self.current_frame_idx)
+        if self.is_playing: self._send_play(self.current_frame_idx)
 
-    # ==========================================================
-    #  渲染循环（主线程 ~60fps）
-    # ==========================================================
+    def _on_timeline_pause_select(self, seg_id: int):
+        for seg in self.pause_segments:
+            if seg['id'] == seg_id:
+                self.settings.set_selected_pause(seg_id, seg.get('mode', 'auto'))
+                break
+
     def _render_loop(self):
         try:
             idx, rgb = self._frame_q.get_nowait()
-            # 以下两种情况不用帧 idx 覆盖 current_frame_idx：
-            # 1. 键盘连续移动中：帧是 150ms 前发的旧位置
-            # 2. 鼠标拖动中：快速来回拖动会积压旧帧，不能让旧帧回弹位置
             if not self._key_hold_fired and not self._is_dragging:
                 self.current_frame_idx = idx
                 self.timeline.current_frame_idx = idx
@@ -573,41 +384,23 @@ class VideoPreviewPlayer(tk.Frame):
         self.after(16, self._render_loop)
 
     def _display_rgb(self, rgb: np.ndarray):
+        img = PIL.Image.fromarray(rgb)
+        photo = PIL.ImageTk.PhotoImage(image=img)
         cw, ch = self._canvas_wh()
-        fh, fw = rgb.shape[:2]
-        if fw != cw or fh != ch:
-            scale = min(cw / fw, ch / fh, 1.0)
-            nw = max(1, int(fw * scale))
-            nh = max(1, int(fh * scale))
-            if nw != fw or nh != fh:
-                rgb = PIL.Image.fromarray(rgb).resize((nw, nh), PIL.Image.LANCZOS)
-            else:
-                rgb = PIL.Image.fromarray(rgb)
-        else:
-            rgb = PIL.Image.fromarray(rgb)
-        photo = PIL.ImageTk.PhotoImage(image=rgb)
         if self._canvas_img_id is None:
             self.video_canvas.delete("all")
-            self._canvas_img_id = self.video_canvas.create_image(
-                cw // 2, ch // 2, image=photo)
+            self._canvas_img_id = self.video_canvas.create_image(cw // 2, ch // 2, image=photo)
         else:
             self.video_canvas.coords(self._canvas_img_id, cw // 2, ch // 2)
             self.video_canvas.itemconfig(self._canvas_img_id, image=photo)
         self._photo = photo
         self._update_labels()
 
-    def _on_canvas_resize(self, event=None):
-        if self._canvas_img_id is not None:
-            self.video_canvas.coords(
-                self._canvas_img_id,
-                self.video_canvas.winfo_width() // 2,
-                self.video_canvas.winfo_height() // 2)
-
     # ==========================================================
-    #  标签更新
+    #  标签更新（增加显示差异值功能）
     # ==========================================================
     def _update_labels(self):
-        cur   = self.current_frame_idx
+        cur = self.current_frame_idx
         cur_s = cur / self.fps if self.fps else 0
         tot_s = self.total_frames / self.fps if self.fps else 0
         self.lbl_time.config(text=f"{self._fmt(cur_s)} / {self._fmt(tot_s)}")
@@ -615,19 +408,19 @@ class VideoPreviewPlayer(tk.Frame):
         info = "普通区域"
         for seg in self.pause_segments:
             if seg['start'] <= cur <= seg['end']:
-                info = (f"暂停 | DCT:{seg.get('dct',0):.0f} | "
-                        f"Hist:{seg.get('hist',0):.4f} | "
-                        f"{'跳变-保留端点' if seg.get('is_diff') else '无跳变-全删'}")
+                mode_str = {'all': '全删', 'keep': '全保留', 'auto': '按设置裁剪'}.get(seg.get('mode', 'auto'), '')
+                bd_diff = seg.get('boundary_diff', 0.0)
+                # 底部界面展示，供用户参考去调参
+                info = f"暂停 | ID: {seg['id']} | 模式: {mode_str} | 边界差异: {bd_diff:.1f}"
                 break
         else:
             p = self.settings.get_params()
             for seg in self.speed_segments:
                 if seg['start'] <= cur <= seg['end']:
-                    t    = seg['type']
-                    name = {FRAME_TYPE_1X:'1x', FRAME_TYPE_2X:'2x',
-                            FRAME_TYPE_0_2X:'0.2x'}.get(t, '?')
-                    eff  = 1
-                    if t == FRAME_TYPE_1X   and p.get('speedup_1x'):  eff = 2
+                    t = seg['type']
+                    name = {FRAME_TYPE_1X: '1x', FRAME_TYPE_2X: '2x', FRAME_TYPE_0_2X: '0.2x'}.get(t, '?')
+                    eff = 1
+                    if t == FRAME_TYPE_1X and p.get('speedup_1x'):  eff = 2
                     if t == FRAME_TYPE_0_2X and p.get('speedup_02'):  eff = p.get('speedup_02_factor', 10)
                     speed_str = self.preview_speed_var.get().rstrip('x')
                     try:
@@ -641,53 +434,74 @@ class VideoPreviewPlayer(tk.Frame):
 
     @staticmethod
     def _fmt(sec: float) -> str:
-        m, s = divmod(int(sec), 60)
+        m, s = divmod(int(sec), 60);
         return f"{m:02d}:{s:02d}"
 
     # ==========================================================
-    #  批量暂停模式（由 settings_panel 三个按钮触发）
+    #  单段与批量暂停模式控制（带有掩码动态重算）
     # ==========================================================
     def apply_pause_mode(self, mode: str):
-        """
-        mode: 'keep' / 'all' / 'auto'
-          keep — 全部保留（空裁剪区）
-          all  — 全部裁剪
-          auto — 按 settings 的 keep_before / keep_after 重算
-        """
-        if not self.pause_segments:
-            return
-        p      = self.settings.get_params()
-        keep_n = p['compare']['keep_n']
-        keep_m = p['compare']['keep_m']
+        import analyzer
+        p = self.settings.get_params()
+        boundary_thresh = p['compare'].get('boundary_thresh', 5.0)
+        motion_thresh = p['compare'].get('motion_thresh', 2.0)
+        still_time = p['compare'].get('still_time_thresh', 0.2)
+        still_frames = max(2, int(self.fps * still_time))
 
         for seg in self.pause_segments:
-            s, e    = seg['start'], seg['end']
-            seg_len = e - s + 1
-            if mode == 'keep':
-                seg['trim_in']  = s
-                seg['trim_out'] = s
-            elif mode == 'all':
-                seg['trim_in']  = s
-                seg['trim_out'] = e + 1
+            if mode == 'auto':
+                # 只要点击了智能裁剪，就利用保存好的 diffs 取出最新参数重算一次内部掩码
+                if self.diffs_array is not None:
+                    new_mask, _ = analyzer._analyze_pause_mask(
+                        seg['start'], seg['end'], self.diffs_array, still_frames, motion_thresh)
+                    seg['local_del_mask'] = new_mask
+
+                if seg.get('boundary_diff', 0.0) < boundary_thresh:
+                    seg['mode'] = 'all'
+                else:
+                    seg['mode'] = 'auto'
             else:
-                n = min(keep_n, seg_len)
-                m = min(keep_m, seg_len - n)
-                ti = s + n
-                to = e - m + 1
-                if ti > to:
-                    ti = to = s
-                seg['trim_in']  = ti
-                seg['trim_out'] = to
+                seg['mode'] = mode
+
+        if self.settings.selected_pause_id is not None:
+            for seg in self.pause_segments:
+                if seg['id'] == self.settings.selected_pause_id:
+                    self.settings.set_selected_pause(self.settings.selected_pause_id, seg['mode'])
+                    break
 
         self.timeline.mark_dirty()
         self.timeline.redraw()
+        if self.is_playing: self._send_play(self.current_frame_idx)
+
+    def set_single_pause_mode(self, seg_id: int, mode: str):
+        import analyzer
+        p = self.settings.get_params()
+        motion_thresh = p['compare'].get('motion_thresh', 2.0)
+        still_time = p['compare'].get('still_time_thresh', 0.1)
+        still_frames = max(2, int(self.fps * still_time))
+
+        for seg in self.pause_segments:
+            if seg['id'] == seg_id:
+                if mode == 'auto':
+                    # 针对单段重算内部裁剪掩码（如果用户调了灵敏度参数）
+                    if self.diffs_array is not None:
+                        new_mask, _ = analyzer._analyze_pause_mask(
+                            seg['start'], seg['end'], self.diffs_array, still_frames, motion_thresh)
+                        seg['local_del_mask'] = new_mask
+
+                seg['mode'] = mode
+
+                self.settings.set_selected_pause(seg_id, seg['mode'])
+                self.timeline.mark_dirty()
+                self.timeline.redraw()
+                if self.is_playing: self._send_play(self.current_frame_idx)
+                break
 
     # ==========================================================
     #  模板分析
     # ==========================================================
     def _start_analysis(self):
-        if not self.video_path:
-            return
+        if not self.video_path: return
         from tkinter import messagebox
         import analyzer
 
@@ -696,98 +510,71 @@ class VideoPreviewPlayer(tk.Frame):
 
         def worker():
             proc_res = list(p['proc_res'])
-            cap_tmp  = cv2.VideoCapture(self.video_path)
-            ret, f   = cap_tmp.read()
+            cap_tmp = cv2.VideoCapture(self.video_path)
+            ret, f = cap_tmp.read()
             cap_tmp.release()
             if ret and proc_res[1] == 225:
-                h, ww    = f.shape[:2]
+                h, ww = f.shape[:2];
                 proc_res[1] = int(proc_res[0] * h / ww)
             proc_res = tuple(proc_res)
 
             configs, loaded = analyzer.load_templates(proc_res)
             if loaded == 0:
-                self.after(0, lambda: messagebox.showwarning(
-                    "模板缺失", "未找到可用模板，将标记所有帧为普通帧。"))
+                self.after(0, lambda: messagebox.showwarning("模板缺失", "未找到可用模板，将标记所有帧为普通帧。"))
 
             def prog(r):
-                self.after(0, lambda: self.btn_analyze.config(
-                    text=f"匹配 {int(r*100)}%"))
+                self.after(0, lambda: self.btn_analyze.config(text=f"匹配/分析 {int(r * 100)}%"))
 
-            states = analyzer.analyze_video(
+            states, diffs = analyzer.analyze_video(
                 self.video_path, configs, p['thresholds'],
                 proc_res, p['batch'], p['threads'], prog)
 
-            self.after(0, lambda: self.btn_analyze.config(text="计算段落..."))
-
             pauses, speeds = analyzer.build_segments(
-                states, self.video_path, proc_res, p['compare'])
+                states, diffs, self.video_path, proc_res, p['compare'], self.fps, prog)
 
-            self.after(0, lambda: self._finish_analysis(states, pauses, speeds))
+            # 把 diffs 一并传给完成函数以持久化
+            self.after(0, lambda: self._finish_analysis(states, diffs, pauses, speeds))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_analysis(self, states, pauses, speeds):
+    def _finish_analysis(self, states, diffs, pauses, speeds):
         from tkinter import messagebox
-        self.states_array   = states
+        self.states_array = states
+        self.diffs_array = diffs  # 储存 diffs
         self.pause_segments = pauses
         self.speed_segments = speeds
-        # 自动生成非暂停区间为 clip_segments
-        self.clip_segments  = self._build_clip_segments(pauses, self.total_frames)
-        # 同步到时间轴
+        self.clip_segments = self._build_clip_segments(pauses, self.total_frames)
+
         self.timeline.pause_segments = self.pause_segments
-        self.timeline.speed_segments  = self.speed_segments
-        self.timeline.clip_segments   = self.clip_segments
+        self.timeline.speed_segments = self.speed_segments
+        self.timeline.clip_segments = self.clip_segments
+
+        self.timeline.selected_pause_id = None
+        self.settings.set_selected_pause(None, "")
+
         self.timeline.mark_dirty()
         self.btn_analyze.config(state=tk.NORMAL, text="自动模板分析")
         self.timeline.redraw()
-        messagebox.showinfo("分析完成",
-                            f"识别到 {len(pauses)} 处暂停，{len(speeds)} 个变速区间。")
+        messagebox.showinfo("分析完成", f"识别到 {len(pauses)} 处暂停，{len(speeds)} 个变速区间。")
 
     @staticmethod
     def _build_clip_segments(pauses: list, total_frames: int) -> list:
-        """
-        把 [0, total_frames) 里所有不属于任何暂停段的连续区间生成为 clip_segments。
-        初始 keep_in = start, keep_out = end（全保留），用户拖手柄来裁两端。
-        """
-        if total_frames <= 0:
-            return []
-
-        # 收集所有暂停段占用的区间，合并后取补集
-        occupied = []
-        for seg in pauses:
-            occupied.append((seg['start'], seg['end']))
-        occupied.sort()
-
-        clips = []
-        clip_id = 0
-        prev_end = -1   # 上一个占用区间的结束帧
-
+        if total_frames <= 0: return []
+        occupied = sorted([(seg['start'], seg['end']) for seg in pauses])
+        clips = [];
+        clip_id = 0;
+        prev_end = -1
         for ps, pe in occupied:
-            gap_start = prev_end + 1
-            gap_end   = ps - 1
+            gap_start, gap_end = prev_end + 1, ps - 1
             if gap_end >= gap_start:
-                clips.append({
-                    'id':       clip_id,
-                    'start':    gap_start,
-                    'end':      gap_end,
-                    'keep_in':  gap_start,
-                    'keep_out': gap_end,
-                })
+                clips.append(
+                    {'id': clip_id, 'start': gap_start, 'end': gap_end, 'keep_in': gap_start, 'keep_out': gap_end})
                 clip_id += 1
             prev_end = pe
-
-        # 最后一个暂停段之后的尾部
-        tail_start = prev_end + 1
-        tail_end   = total_frames - 1
+        tail_start, tail_end = prev_end + 1, total_frames - 1
         if tail_end >= tail_start:
-            clips.append({
-                'id':       clip_id,
-                'start':    tail_start,
-                'end':      tail_end,
-                'keep_in':  tail_start,
-                'keep_out': tail_end,
-            })
-
+            clips.append(
+                {'id': clip_id, 'start': tail_start, 'end': tail_end, 'keep_in': tail_start, 'keep_out': tail_end})
         return clips
 
     # ==========================================================
@@ -797,37 +584,29 @@ class VideoPreviewPlayer(tk.Frame):
         from tkinter import messagebox
         import analyzer
 
-        if not self.video_path:
-            messagebox.showerror("错误", "请先加载视频"); return
+        if not self.video_path: return messagebox.showerror("错误", "请先加载视频")
         p = self.settings.get_params()
-        if not p['output']:
-            messagebox.showerror("错误", "请先设置输出路径"); return
+        if not p['output']: return messagebox.showerror("错误", "请先设置输出路径")
 
-        states = self.states_array
-        if states is None:
-            states = np.zeros(self.total_frames, dtype=np.int8)
+        states = self.states_array if self.states_array is not None else np.zeros(self.total_frames, dtype=np.int8)
         self.settings.export_btn.config(state=tk.DISABLED)
 
         def worker():
             to_del = analyzer.build_delete_set(
-                self.total_frames, states,
-                self.pause_segments, self.speed_segments,
-                self.clip_segments,
-                p['speedup_1x'], p['speedup_02'], p['speedup_02_factor'])
+                self.total_frames, states, self.pause_segments, self.speed_segments,
+                self.clip_segments, p['speedup_1x'], p['speedup_02'], p['speedup_02_factor'])
 
             def prog(ratio, written):
                 self.settings.export_progress_var.set(ratio * 100)
-                self.settings.export_status_var.set(f"写入 {int(ratio*100)}%")
+                self.settings.export_status_var.set(f"写入 {int(ratio * 100)}%")
 
             try:
                 written, total = analyzer.export_video(
-                    self.video_path, p['output'], to_del,
-                    self.fps, p['quality'], prog,use_gpu=p.get('export_use_gpu', False))
-                self.after(0, lambda: self.settings.export_status_var.set(
-                    f"完成！{written}/{total} 帧（已同步音频）"))
-                self.after(0, lambda: messagebox.showinfo(
-                    "导出完成",
-                    f"输出：{p['output']}\n总帧：{total}，保留：{written}\n已同步合并音频"))
+                    self.video_path, p['output'], to_del, self.fps, p['quality'], prog,
+                    use_gpu=p.get('export_use_gpu', False))
+                self.after(0, lambda: self.settings.export_status_var.set(f"完成！{written}/{total} 帧"))
+                self.after(0,
+                           lambda: messagebox.showinfo("导出完成", f"输出：{p['output']}\n总帧：{total}，保留：{written}"))
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("导出失败", str(e)))
             finally:
@@ -835,25 +614,15 @@ class VideoPreviewPlayer(tk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
-
-    # ==========================================================
-    #  分段导出（仅导出时间轴有效区域，不应用基础参数变速）
-    # ==========================================================
     @staticmethod
     def _speed_label(state: int) -> str:
-        return {
-            FRAME_TYPE_2X: '2x',
-            FRAME_TYPE_1X: '1x',
-            FRAME_TYPE_0_2X: '0.2x',
-            FRAME_TYPE_NORMAL: 'other',
-        }.get(state, 'other')
+        return {FRAME_TYPE_2X: '2x', FRAME_TYPE_1X: '1x', FRAME_TYPE_0_2X: '0.2x', FRAME_TYPE_NORMAL: 'other'}.get(
+            state, 'other')
 
-    def _build_valid_segments_for_export(self, states: np.ndarray, split_by_speed: bool) -> list:
+    def _build_valid_segments_for_export(self, states: np.ndarray, split_by_speed: bool, merge_pause: bool) -> list:
         import analyzer
-
         to_del = analyzer.build_delete_set(
-            self.total_frames, states,
-            self.pause_segments, self.speed_segments, self.clip_segments,
+            self.total_frames, states, self.pause_segments, self.speed_segments, self.clip_segments,
             speedup_1x=False, speedup_02=False, speedup_02_factor=1)
         valid = ~to_del
 
@@ -867,97 +636,117 @@ class VideoPreviewPlayer(tk.Frame):
             cur_state = int(states[i])
             is_pause = (cur_state == FRAME_TYPE_PAUSE)
             speed_label = self._speed_label(cur_state)
-            s = i
-            i += 1
-            while i < self.total_frames and valid[i]:
-                st = int(states[i])
-                if is_pause:
-                    if st != FRAME_TYPE_PAUSE:
-                        break
-                else:
-                    if st == FRAME_TYPE_PAUSE:
-                        break
-                    if split_by_speed and self._speed_label(st) != speed_label:
-                        break
-                i += 1
-            e = i - 1
 
-            if is_pause:
-                label = 'pause'
-            elif split_by_speed:
-                label = speed_label
+            if is_pause and merge_pause:
+                p_end = self.total_frames - 1
+                for pseg in self.pause_segments:
+                    if pseg['start'] <= i <= pseg['end']:
+                        p_end = pseg['end']
+                        break
+
+                ranges = []
+                j = i
+                while j <= p_end and j < self.total_frames:
+                    if valid[j] and int(states[j]) == FRAME_TYPE_PAUSE:
+                        rs = j
+                        while j <= p_end and j < self.total_frames and valid[j] and int(states[j]) == FRAME_TYPE_PAUSE:
+                            j += 1
+                        ranges.append((rs, j - 1))
+                    else:
+                        j += 1
+
+                segs.append({'ranges': ranges, 'label': 'pause_merged'})
+                i = p_end + 1
             else:
-                label = 'normal'
+                s = i
+                while i < self.total_frames and valid[i]:
+                    st = int(states[i])
+                    if is_pause:
+                        if st != FRAME_TYPE_PAUSE: break
+                    else:
+                        if st == FRAME_TYPE_PAUSE: break
+                        if split_by_speed and self._speed_label(st) != speed_label: break
+                    i += 1
+                e = i - 1
 
-            segs.append({
-                'start': s,
-                'end': e,
-                'label': label,
-            })
-        return segs
+                label = 'pause' if is_pause else (speed_label if split_by_speed else 'normal')
+                segs.append({'ranges': [(s, e)], 'label': label})
+
+        # 新增：合并因为中间“全删”而导致的连续同类型片段
+        merged_segs = []
+        for seg in segs:
+            if not merged_segs:
+                merged_segs.append(seg)
+            else:
+                last_seg = merged_segs[-1]
+                # 当标签完全一致，且不是独立的暂停区时（避免两次分别的人工有效暂停被误合），进行跨区合并
+                if last_seg['label'] == seg['label'] and 'pause' not in seg['label']:
+                    last_seg['ranges'].extend(seg['ranges'])
+                else:
+                    merged_segs.append(seg)
+
+        return merged_segs
 
     def export_segments(self):
         from tkinter import messagebox
         import analyzer
 
-        if not self.video_path:
-            messagebox.showerror("错误", "请先加载视频")
-            return
+        if not self.video_path: return messagebox.showerror("错误", "请先加载视频")
 
         p = self.settings.get_params()
         out_path = p.get('output') or ""
-        if not out_path:
-            messagebox.showerror("错误", "请先设置导出路径（用于确定分段输出目录）")
-            return
+        if not out_path: return messagebox.showerror("错误", "请先设置导出路径（用于确定分段输出目录）")
 
         out_root = os.path.dirname(out_path) or os.getcwd()
         base = os.path.splitext(os.path.basename(out_path))[0] or "segments"
         out_dir = os.path.join(out_root, f"{base}_segments")
         os.makedirs(out_dir, exist_ok=True)
 
-        states = self.states_array
-        if states is None:
-            states = np.zeros(self.total_frames, dtype=np.int8)
+        states = self.states_array if self.states_array is not None else np.zeros(self.total_frames, dtype=np.int8)
 
         split = self.settings.segment_split_by_speed_var.get()
-        segs = self._build_valid_segments_for_export(states, split)
-        if not segs:
-            messagebox.showwarning("提示", "当前时间轴没有可导出的有效片段。")
-            return
+        merge_pause = self.settings.merge_pause_ops_var.get()
+        segs = self._build_valid_segments_for_export(states, split, merge_pause)
+        if not segs: return messagebox.showwarning("提示", "当前时间轴没有可导出的有效片段。")
 
         self.settings.segment_export_btn.config(state=tk.DISABLED)
 
         def worker():
             total = len(segs)
             pad = max(1, len(str(total)))
-            exported = 0
 
-            for idx, seg in enumerate(segs, start=1):
+            completed = 0
+            lock = threading.Lock()
+
+            def export_single(idx_seg):
+                idx, seg = idx_seg
                 stem = f"{idx:0{pad}d}_{seg['label']}"
                 final_path = os.path.join(out_dir, f"{stem}.mp4")
                 try:
-                    analyzer.export_frame_range(
-                        self.video_path, final_path,
-                        seg['start'], seg['end'],
-                        self.fps, p['quality'],
-                        use_gpu=p.get('export_use_gpu', False))
-                    exported += 1
-                except Exception:
-                    if os.path.exists(final_path):
-                        os.remove(final_path)
+                    analyzer.export_ranges(
+                        self.video_path, final_path, seg['ranges'],
+                        self.fps, p['quality'], use_gpu=p.get('export_use_gpu', False))
+                except Exception as e:
+                    print(f"Export failed for {stem}: {e}")
+                    if os.path.exists(final_path): os.remove(final_path)
 
-                ratio = idx / total
-                self.after(0, lambda r=ratio, i=idx, t=total: (
-                    self.settings.segment_export_progress_var.set(r * 100),
-                    self.settings.segment_export_status_var.set(
-                        f"导出分段 {i}/{t}")))
+                nonlocal completed
+                with lock:
+                    completed += 1
+                    ratio = completed / total
+                    self.after(0, lambda r=ratio, c=completed, t=total: (
+                        self.settings.segment_export_progress_var.set(r * 100),
+                        self.settings.segment_export_status_var.set(f"导出分段 {c}/{t}")))
+
+            max_w = max(1, os.cpu_count() // 2)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
+                list(executor.map(export_single, enumerate(segs, start=1)))
 
             self.after(0, lambda: self.settings.segment_export_status_var.set(
-                f"完成：{exported}/{total} 段（已同步音频）"))
+                f"完成：{completed}/{total} 段（分段导出默认不保留音频）"))
             self.after(0, lambda: messagebox.showinfo(
                 "分段导出完成",
-                f"输出目录：{out_dir}\n完成：{exported}/{total} 段\n"
-                "说明：已同步合并音频。"))
+                f"输出目录：{out_dir}\n完成：{completed}/{total} 段\n说明：分段导出默认不保留音频，以避免音画错位/拖尾问题。"))
             self.after(0, lambda: self.settings.segment_export_btn.config(state=tk.NORMAL))
 
         threading.Thread(target=worker, daemon=True).start()
