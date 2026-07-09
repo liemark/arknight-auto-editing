@@ -367,7 +367,8 @@ def build_delete_set(total: int, states: np.ndarray,
 
 
 def export_video(video_path: str, output_path: str, to_del,
-                 fps: float, quality: int, progress_cb=None, use_gpu: bool = False):
+                 fps: float, quality: int, progress_cb=None,
+                 use_gpu: bool = False, gpu_encoder: str = ""):
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -387,7 +388,8 @@ def export_video(video_path: str, output_path: str, to_del,
     writer = None
 
     if shutil.which("ffmpeg"):
-        ffmpeg_proc = _open_ffmpeg_pipe_writer(output_path, fps, w, h, quality, use_gpu=use_gpu)
+        ffmpeg_proc = _open_ffmpeg_pipe_writer(output_path, fps, w, h, quality, use_gpu=use_gpu,
+                                               gpu_encoder=gpu_encoder)
         writer_kind = "ffmpeg"
     else:
         try:
@@ -439,7 +441,8 @@ def export_video(video_path: str, output_path: str, to_del,
 
 
 def export_ranges(video_path: str, output_path: str, ranges: list,
-                  fps: float, quality: int, progress_cb=None, use_gpu: bool = False):
+                  fps: float, quality: int, progress_cb=None,
+                  use_gpu: bool = False, gpu_encoder: str = ""):
     if not ranges:
         return 0, 0
 
@@ -452,7 +455,7 @@ def export_ranges(video_path: str, output_path: str, ranges: list,
 
         cmd = ["ffmpeg", "-y", "-ss", f"{start_sec:.4f}", "-i", video_path, "-frames:v", str(frames)]
 
-        enc = _pick_gpu_encoder() if use_gpu else None
+        enc = gpu_encoder if (use_gpu and gpu_encoder) else (_pick_gpu_encoder() if use_gpu else None)
         if enc == "h264_nvenc":
             cmd += ["-c:v", enc, "-preset", "p4", "-cq", str(18 + (10 - q))]
         elif enc == "h264_qsv":
@@ -491,7 +494,8 @@ def export_ranges(video_path: str, output_path: str, ranges: list,
     writer = None
 
     if shutil.which("ffmpeg"):
-        ffmpeg_proc = _open_ffmpeg_pipe_writer(output_path, fps, w, h, quality, use_gpu=use_gpu)
+        ffmpeg_proc = _open_ffmpeg_pipe_writer(output_path, fps, w, h, quality, use_gpu=use_gpu,
+                                               gpu_encoder=gpu_encoder)
         writer_kind = "ffmpeg"
     else:
         try:
@@ -546,7 +550,8 @@ def _pick_gpu_encoder() -> str | None:
     return None
 
 
-def _open_ffmpeg_pipe_writer(output_path: str, fps: float, w: int, h: int, quality: int, use_gpu: bool):
+def _open_ffmpeg_pipe_writer(output_path: str, fps: float, w: int, h: int, quality: int, use_gpu: bool,
+                             gpu_encoder: str = ""):
     q = max(0, min(10, int(quality)))
     crf = int(round(28 - q))
     base_cmd = [
@@ -555,7 +560,7 @@ def _open_ffmpeg_pipe_writer(output_path: str, fps: float, w: int, h: int, quali
     ]
 
     if use_gpu:
-        enc = _pick_gpu_encoder()
+        enc = gpu_encoder if gpu_encoder else _pick_gpu_encoder()
         if enc:
             if enc == "h264_nvenc":
                 cmd = base_cmd + ["-c:v", enc, "-preset", "p4", "-cq", str(18 + (10 - q)), output_path]

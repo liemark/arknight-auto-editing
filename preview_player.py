@@ -445,7 +445,7 @@ class VideoPreviewPlayer(tk.Frame):
         p = self.settings.get_params()
         boundary_thresh = p['compare'].get('boundary_thresh', 5.0)
         motion_thresh = p['compare'].get('motion_thresh', 2.0)
-        still_time = p['compare'].get('still_time_thresh', 0.2)
+        still_time = p['compare'].get('still_time_thresh', 0.1)
         still_frames = max(2, int(self.fps * still_time))
 
         for seg in self.pause_segments:
@@ -603,7 +603,8 @@ class VideoPreviewPlayer(tk.Frame):
             try:
                 written, total = analyzer.export_video(
                     self.video_path, p['output'], to_del, self.fps, p['quality'], prog,
-                    use_gpu=p.get('export_use_gpu', False))
+                    use_gpu=p.get('export_use_gpu', False),
+                    gpu_encoder=p.get('gpu_encoder', ''))
                 self.after(0, lambda: self.settings.export_status_var.set(f"完成！{written}/{total} 帧"))
                 self.after(0,
                            lambda: messagebox.showinfo("导出完成", f"输出：{p['output']}\n总帧：{total}，保留：{written}"))
@@ -725,7 +726,9 @@ class VideoPreviewPlayer(tk.Frame):
                 try:
                     analyzer.export_ranges(
                         self.video_path, final_path, seg['ranges'],
-                        self.fps, p['quality'], use_gpu=p.get('export_use_gpu', False))
+                        self.fps, p['quality'],
+                        use_gpu=p.get('export_use_gpu', False),
+                        gpu_encoder=p.get('gpu_encoder', ''))
                 except Exception as e:
                     print(f"Export failed for {stem}: {e}")
                     if os.path.exists(final_path): os.remove(final_path)

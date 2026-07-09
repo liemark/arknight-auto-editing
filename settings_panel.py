@@ -217,7 +217,12 @@ class SettingsPanel(ttk.LabelFrame):
         self.export_use_gpu_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             tab_export, text="启用 GPU 导出加速(FFmpeg)",
-            variable=self.export_use_gpu_var).grid(row=r, column=0, columnspan=3, sticky=tk.W, pady=(6, 2))
+            variable=self.export_use_gpu_var).grid(row=r, column=0, sticky=tk.W, pady=(6, 2))
+
+        self.gpu_encoder_var = tk.StringVar()
+        self.gpu_encoder_combo = ttk.Combobox(
+            tab_export, textvariable=self.gpu_encoder_var, state="readonly", width=18)
+        self.gpu_encoder_combo.grid(row=r, column=1, columnspan=2, sticky=tk.W, pady=(6, 2))
         r += 1
 
         self.gpu_encoder_hint = tk.StringVar(value="")
@@ -269,15 +274,24 @@ class SettingsPanel(ttk.LabelFrame):
         try:
             out = subprocess.check_output(
                 ["ffmpeg", "-hide_banner", "-encoders"], text=True, stderr=subprocess.STDOUT)
-            candidates = ("h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox")
-            gpu_encoder = next((enc for enc in candidates if enc in out), None)
-            if gpu_encoder:
-                self.gpu_encoder_hint.set(f"检测到可用的GPU编码器:\n {gpu_encoder}")
+            candidates = ["h264_nvenc", "h264_amf", "h264_qsv", "h264_videotoolbox"]
+            available = [enc for enc in candidates if enc in out]
+            if available:
+                self.gpu_encoder_combo['values'] = available
+                self.gpu_encoder_combo.current(0)
+                self.gpu_encoder_hint.set(
+                    "检测到支持的 GPU 编码器，请根据显卡选择：\nNVIDIA: nvenc | AMD: amf | Intel: qsv")
                 self.export_use_gpu_var.set(True)
             else:
+                self.gpu_encoder_combo['values'] = ["无可用编码器"]
+                self.gpu_encoder_combo.current(0)
+                self.gpu_encoder_combo.config(state=tk.DISABLED)
                 self.gpu_encoder_hint.set("未检测到GPU编码器，将使用CPU编码")
                 self.export_use_gpu_var.set(False)
         except Exception as e:
+            self.gpu_encoder_combo['values'] = ["未找到 FFmpeg"]
+            self.gpu_encoder_combo.current(0)
+            self.gpu_encoder_combo.config(state=tk.DISABLED)
             self.gpu_encoder_hint.set("未找到FFmpeg，请确认已安装并添加到PATH")
             self.export_use_gpu_var.set(False)
 
@@ -304,5 +318,6 @@ class SettingsPanel(ttk.LabelFrame):
             'output': self.output_var.get(),
             'quality': self.quality_var.get(),
             'export_use_gpu': self.export_use_gpu_var.get(),
+            'gpu_encoder': self.gpu_encoder_var.get(),
             'merge_pause_ops': self.merge_pause_ops_var.get(),
         }
