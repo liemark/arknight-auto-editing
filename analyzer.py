@@ -444,13 +444,12 @@ def _gpu_encoder_probe_args(enc: str) -> list[str]:
 
 def _gpu_encoder_works(enc: str, timeout: float = 5) -> bool:
     # 单飞探测：探测全程持锁，避免多线程并发启动多个 ffmpeg 探测同一编码器，
-    # 进而在 GPU 资源紧张时因并发抢占产生假阴性并污染缓存。
+    # 进而在 GPU 资源紧张时因并发抢占产生假阴性。
     with _GPU_PROBE_LOCK:
         cached = _GPU_PROBE_CACHE.get(enc)
         if cached is not None:
             return cached
 
-        works = False
         try:
             subprocess.run(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -458,15 +457,22 @@ def _gpu_encoder_works(enc: str, timeout: float = 5) -> bool:
                  *_gpu_encoder_probe_args(enc), "-f", "null", "-"],
                 check=True, capture_output=True, timeout=timeout,
                 creationflags=_NO_WINDOW)
-            works = True
         except FileNotFoundError:
-            # FFmpeg 不在 PATH：不缓存，避免污染整个进程生命周期。
+            # FFmpeg 不在 PATH：确定不可用，缓存 False。
+            _GPU_PROBE_CACHE[enc] = False
+            return False
+        except subprocess.CalledProcessError:
+            # 编码器确实初始化失败（ffmpeg 正常退出且给出错误）：缓存 False。
+            # 但超时（TimeoutExpired）等瞬时失败不在此分支，不缓存。
+            _GPU_PROBE_CACHE[enc] = False
             return False
         except Exception:
-            works = False
+            # 瞬时失败（超时、GPU 被占用、驱动初始化等）：不缓存，下次重新探测，
+            # 避免一次偶发失败永久禁用该编码器。
+            return False
 
-        _GPU_PROBE_CACHE[enc] = works
-        return works
+        _GPU_PROBE_CACHE[enc] = True
+        return True
 
 
 def list_ffmpeg_gpu_encoders() -> list[str]:
@@ -478,7 +484,10 @@ def list_ffmpeg_gpu_encoders() -> list[str]:
     except Exception:
         return []
 
-    candidates = ["h264_amf", "h264_nvenc", "h264_qsv", "h264_videotoolbox"]
+    # 顺序即优先级：nvenc（NVIDIA）通常最快最稳，其次是 qsv（Intel）、amf（AMD）。
+    # 纯 AMD 机型误选不可用 nvenc 的问题（issue #3）已由 _gpu_encoder_works 的实测探测解决，
+    # 不依赖把 amf 提前；探测通过的编码器按此序取首个即可。
+    candidates = ["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox"]
     return [enc for enc in candidates if enc in output]
 
 
@@ -526,8 +535,12 @@ def _export_ranges_with_ffmpeg_filters(
         video_path: str, output_path: str, ranges: list[tuple[int, int]],
         fps: float, quality: int, use_gpu: bool, gpu_encoder: str,
         include_audio: bool, progress_cb=None) -> bool:
-    """使用 FFmpeg trim/concat 快速导出左闭右开的帧区间。"""
-    if not ranges or len(ranges) > 120:
+    """使用 FFmpeg trim/concat 快速导出左闭右开的帧区间。
+
+    滤镜图通过 -filter_complex_script 写入文件（不走命令行），ffmpeg concat
+    可处理上千段，因此不再对段数设上限；空 ranges 时直接回退逐帧路径。
+    """
+    if not ranges:
         return False
 
     has_audio = include_audio and _has_audio_stream(video_path)
@@ -577,7 +590,18 @@ def _export_ranges_with_ffmpeg_filters(
             if progress_cb:
                 progress_cb(1.0, sum(end - start for start, end in ranges))
             return True
-        except Exception:
+        except subprocess.CalledProcessError as exc:
+            # 快速滤镜路径失败：删除 ffmpeg 写了一半的输出，回退到逐帧路径。
+            # 同时打印 ffmpeg 的真实 stderr，避免“静默变慢 + 无诊断”。
+            err = (exc.stderr or b"").decode("utf-8", errors="ignore").strip()
+            if err:
+                print(f"[analyzer] 快速滤镜导出失败，回退逐帧路径。ffmpeg stderr: {err}")
+            if os.path.isfile(output_path):
+                os.remove(output_path)
+            return False
+        except Exception as exc:
+            # 超时/其它异常同样回退，但打印原因，不再完全静默。
+            print(f"[analyzer] 快速滤镜导出异常，回退逐帧路径: {exc}")
             if os.path.isfile(output_path):
                 os.remove(output_path)
             return False
@@ -603,13 +627,29 @@ def _mux_audio_for_ranges(video_path: str, video_only_path: str,
         with open(filter_file, "w", encoding="utf-8") as handle:
             handle.write(";\n".join(lines))
 
-        subprocess.run(
-            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
-             "-i", video_path, "-i", video_only_path,
-             "-filter_complex_script", filter_file,
-             "-map", "1:v:0", "-map", "[outa]",
-             "-c:v", "copy", "-c:a", "aac", "-shortest", output_path],
-            check=True, capture_output=True, timeout=1800, creationflags=_NO_WINDOW)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+                 "-i", video_path, "-i", video_only_path,
+                 "-filter_complex_script", filter_file,
+                 "-map", "1:v:0", "-map", "[outa]",
+                 "-c:v", "copy", "-c:a", "aac", "-shortest", output_path],
+                check=True, capture_output=True, timeout=1800, creationflags=_NO_WINDOW)
+        except Exception as exc:
+            # 混流失败：删除可能被 ffmpeg 截断/写半的损坏输出，避免残留假成品。
+            if os.path.isfile(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            stderr = b""
+            if isinstance(exc, subprocess.CalledProcessError):
+                stderr = exc.stderr or b""
+            if stderr:
+                raise RuntimeError(
+                    f"音频混流失败: {stderr.decode('utf-8', errors='ignore')}"
+                ) from exc
+            raise
 
 
 def export_video(video_path: str, output_path: str, to_del,
@@ -704,14 +744,27 @@ def export_video(video_path: str, output_path: str, to_del,
                 progress_cb(idx / total, written)
     finally:
         cap.release()
-        _close_video_writer(writer_kind, writer, ffmpeg_proc)
+        try:
+            _close_video_writer(writer_kind, writer, ffmpeg_proc)
+        except Exception:
+            # 编码器关闭失败（ffmpeg 非零退出/超时）：仍需清理临时文件再向上抛错。
+            if use_ffmpeg and video_only_path != output_path and os.path.isfile(video_only_path):
+                try:
+                    os.remove(video_only_path)
+                except OSError:
+                    pass
+            raise
 
     if use_ffmpeg:
         try:
             _mux_audio_for_ranges(video_path, video_only_path, output_path, ranges, fps)
         finally:
-            if os.path.isfile(video_only_path):
-                os.remove(video_only_path)
+            # 混流结束（无论成功失败）都要回收 video-only 临时文件。
+            if video_only_path != output_path and os.path.isfile(video_only_path):
+                try:
+                    os.remove(video_only_path)
+                except OSError:
+                    pass
     return written, total
 
 
@@ -829,8 +882,13 @@ def _close_video_writer(writer_kind, writer, ffmpeg_proc):
         try:
             returncode = ffmpeg_proc.process.wait(timeout=1800)
         except subprocess.TimeoutExpired:
+            # 超时：发 kill 后再限时回收，避免 kill 仍不返回时无限阻塞。
             ffmpeg_proc.process.kill()
-            returncode = ffmpeg_proc.process.wait()
+            try:
+                returncode = ffmpeg_proc.process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                # 进程拒绝退出：不再死等，按超时处理并尽量回收 stderr。
+                returncode = -1
             timed_out = True
         try:
             stderr_file.seek(0)
