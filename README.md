@@ -10,6 +10,19 @@
 默认参数已经有较好的剪辑效果  
 还提供了时间轴用于暂停事件的精细化调整与视频预览  
 目前是纯python版本，瓶颈在H.264解码
+
+## uv 安装
+
+```bash
+uv sync
+uv run arknight-auto-editing
+```
+
+如果只想按依赖文件安装，也可以使用：
+
+```bash
+uv pip install -r requirements.txt
+```
 ```
 链接: https://pan.baidu.com/s/1_LF18ARW5CLo62MeSYMVpQ?pwd=2333
 提取码: 2333

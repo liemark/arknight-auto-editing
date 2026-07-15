@@ -1,0 +1,19 @@
+[project]
+name = "arknight-auto-editing"
+version = "26.7.10"
+description = "明日方舟剪辑工具"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "pillow",
+    "imageio",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller",
+]
+
+[project.scripts]
+arknight-auto-editing = "main:main"
