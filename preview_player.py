@@ -597,8 +597,9 @@ class VideoPreviewPlayer(tk.Frame):
                 self.clip_segments, p['speedup_1x'], p['speedup_02'], p['speedup_02_factor'])
 
             def prog(ratio, written):
-                self.settings.export_progress_var.set(ratio * 100)
-                self.settings.export_status_var.set(f"写入 {int(ratio * 100)}%")
+                self.after(0, lambda r=ratio: (
+                    self.settings.export_progress_var.set(r * 100),
+                    self.settings.export_status_var.set(f"写入 {int(r * 100)}%")))
 
             try:
                 written, total = analyzer.export_video(
@@ -607,9 +608,11 @@ class VideoPreviewPlayer(tk.Frame):
                     gpu_encoder=p.get('gpu_encoder', ''))
                 self.after(0, lambda: self.settings.export_status_var.set(f"完成！{written}/{total} 帧"))
                 self.after(0,
-                           lambda: messagebox.showinfo("导出完成", f"输出：{p['output']}\n总帧：{total}，保留：{written}"))
+                           lambda: messagebox.showinfo(
+                               "导出完成",
+                               f"输出：{p['output']}\n总帧：{total}，保留：{written}\n已保留原始音频（如有）"))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("导出失败", str(e)))
+                self.after(0, lambda err=str(e): messagebox.showerror("导出失败", err))
             finally:
                 self.after(0, lambda: self.settings.export_btn.config(state=tk.NORMAL))
 
@@ -717,39 +720,65 @@ class VideoPreviewPlayer(tk.Frame):
             pad = max(1, len(str(total)))
 
             completed = 0
+            succeeded = 0
+            failures = []
             lock = threading.Lock()
 
             def export_single(idx_seg):
                 idx, seg = idx_seg
                 stem = f"{idx:0{pad}d}_{seg['label']}"
                 final_path = os.path.join(out_dir, f"{stem}.mp4")
+                success = False
+                error_text = ""
                 try:
-                    analyzer.export_ranges(
+                    written, _ = analyzer.export_ranges(
                         self.video_path, final_path, seg['ranges'],
                         self.fps, p['quality'],
                         use_gpu=p.get('export_use_gpu', False),
                         gpu_encoder=p.get('gpu_encoder', ''))
+                    success = written > 0 and os.path.isfile(final_path) and os.path.getsize(final_path) > 0
+                    if not success:
+                        error_text = "未生成有效输出文件"
                 except Exception as e:
-                    print(f"Export failed for {stem}: {e}")
-                    if os.path.exists(final_path): os.remove(final_path)
+                    error_text = str(e)
+                    print(f"Export failed for {stem}: {error_text}")
+                if not success and os.path.isfile(final_path):
+                    try:
+                        os.remove(final_path)
+                    except OSError as cleanup_error:
+                        error_text += f"；清理失败: {cleanup_error}"
 
-                nonlocal completed
+                nonlocal completed, succeeded
                 with lock:
                     completed += 1
+                    if success:
+                        succeeded += 1
+                    else:
+                        failures.append((stem, error_text))
                     ratio = completed / total
-                    self.after(0, lambda r=ratio, c=completed, t=total: (
+                    self.after(0, lambda r=ratio, c=completed, ok=succeeded, t=total: (
                         self.settings.segment_export_progress_var.set(r * 100),
-                        self.settings.segment_export_status_var.set(f"导出分段 {c}/{t}")))
+                        self.settings.segment_export_status_var.set(
+                            f"处理 {c}/{t}，成功 {ok}，失败 {c - ok}")))
 
-            max_w = max(1, os.cpu_count() // 2)
+            max_w = 1 if p.get('export_use_gpu', False) else max(1, (os.cpu_count() or 2) // 2)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
                 list(executor.map(export_single, enumerate(segs, start=1)))
 
+            failed = len(failures)
             self.after(0, lambda: self.settings.segment_export_status_var.set(
-                f"完成：{completed}/{total} 段（分段导出默认不保留音频）"))
-            self.after(0, lambda: messagebox.showinfo(
-                "分段导出完成",
-                f"输出目录：{out_dir}\n完成：{completed}/{total} 段\n说明：分段导出默认不保留音频，以避免音画错位/拖尾问题。"))
+                f"完成：成功 {succeeded}/{total}，失败 {failed}（分段默认不保留音频）"))
+            details = "\n".join(
+                f"- {name}: {error[:500]}" for name, error in failures[:3])
+            if failed:
+                self.after(0, lambda msg=details: messagebox.showwarning(
+                    "分段导出完成",
+                    f"输出目录：{out_dir}\n成功：{succeeded}/{total}\n失败：{failed}/{total}"
+                    + (f"\n\n部分错误：\n{msg}" if msg else "")))
+            else:
+                self.after(0, lambda: messagebox.showinfo(
+                    "分段导出完成",
+                    f"输出目录：{out_dir}\n成功：{succeeded}/{total}\n说明：分段导出默认不保留音频。"))
             self.after(0, lambda: self.settings.segment_export_btn.config(state=tk.NORMAL))
 
         threading.Thread(target=worker, daemon=True).start()

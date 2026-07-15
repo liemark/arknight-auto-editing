@@ -3,7 +3,8 @@
 import tkinter as tk
 from tkinter import ttk, filedialog
 import os
-import subprocess
+import threading
+from queue import Empty, Queue
 
 
 class SettingsPanel(ttk.LabelFrame):
@@ -271,29 +272,64 @@ class SettingsPanel(ttk.LabelFrame):
             self.apply_pause_callback(mode)
 
     def _detect_gpu_encoder(self):
-        try:
-            out = subprocess.check_output(
-                ["ffmpeg", "-hide_banner", "-encoders"], text=True, stderr=subprocess.STDOUT)
-            candidates = ["h264_nvenc", "h264_amf", "h264_qsv", "h264_videotoolbox"]
-            available = [enc for enc in candidates if enc in out]
-            if available:
-                self.gpu_encoder_combo['values'] = available
+        self.gpu_encoder_hint.set("正在实际测试 GPU 编码器...")
+        self.export_use_gpu_var.set(False)
+        result_queue = Queue(maxsize=1)
+
+        def apply_result(listed: list[str], working: list[str], error: str = ""):
+            if error:
+                self.gpu_encoder_combo['values'] = ["未找到 FFmpeg"]
                 self.gpu_encoder_combo.current(0)
-                self.gpu_encoder_hint.set(
-                    "检测到支持的 GPU 编码器，请根据显卡选择：\nNVIDIA: nvenc | AMD: amf | Intel: qsv")
-                self.export_use_gpu_var.set(True)
-            else:
+                self.gpu_encoder_combo.config(state=tk.DISABLED)
+                self.gpu_encoder_hint.set(error)
+                self.export_use_gpu_var.set(False)
+                return
+
+            if not listed:
                 self.gpu_encoder_combo['values'] = ["无可用编码器"]
                 self.gpu_encoder_combo.current(0)
                 self.gpu_encoder_combo.config(state=tk.DISABLED)
-                self.gpu_encoder_hint.set("未检测到GPU编码器，将使用CPU编码")
+                self.gpu_encoder_hint.set("FFmpeg 未提供支持的 GPU 编码器，将使用 CPU 编码")
                 self.export_use_gpu_var.set(False)
-        except Exception as e:
-            self.gpu_encoder_combo['values'] = ["未找到 FFmpeg"]
-            self.gpu_encoder_combo.current(0)
-            self.gpu_encoder_combo.config(state=tk.DISABLED)
-            self.gpu_encoder_hint.set("未找到FFmpeg，请确认已安装并添加到PATH")
-            self.export_use_gpu_var.set(False)
+                return
+
+            # 下拉框优先展示实测可用的编码器，未通过测试的列出项附在后面供手动尝试，
+            # 保证用户对编码器的完全控制权。
+            unverified = [enc for enc in listed if enc not in working]
+            self.gpu_encoder_combo.config(state="readonly")
+            self.gpu_encoder_combo['values'] = working + unverified
+            selected = working[0] if working else (listed[0] if listed else "")
+            self.gpu_encoder_var.set(selected)
+            if working:
+                hint = "实际测试可用: " + ", ".join(working)
+                if unverified:
+                    hint += "\n未通过测试: " + ", ".join(unverified)
+                hint += "\n未通过测试的手动选择将回退到 CPU"
+                self.gpu_encoder_hint.set(hint)
+                self.export_use_gpu_var.set(True)
+            else:
+                self.gpu_encoder_hint.set("列出的 GPU 编码器均未通过测试，默认使用 CPU 编码")
+                self.export_use_gpu_var.set(False)
+
+        def worker():
+            try:
+                import analyzer
+                listed = analyzer.list_ffmpeg_gpu_encoders()
+                working = [enc for enc in listed if analyzer._gpu_encoder_works(enc)]
+                result_queue.put((listed, working, ""))
+            except Exception:
+                result_queue.put(([], [], "未找到FFmpeg，请确认已安装并添加到PATH"))
+
+        def poll_result():
+            try:
+                listed, working, error = result_queue.get_nowait()
+            except Empty:
+                self.after(100, poll_result)
+                return
+            apply_result(listed, working, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(100, poll_result)
 
     def get_params(self) -> dict:
         return {

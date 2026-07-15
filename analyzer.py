@@ -7,8 +7,29 @@ import shutil
 import subprocess
 import concurrent.futures
 import multiprocessing
+import sys
+import tempfile
+import threading
+from dataclasses import dataclass
+from typing import Any
 from frame_types import (FRAME_TYPE_NORMAL, FRAME_TYPE_PAUSE,
                          FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X)
+
+_NO_WINDOW = 0x08000000 if sys.platform == 'win32' else 0
+_GPU_PROBE_CACHE: dict[str, bool] = {}
+_GPU_PROBE_LOCK = threading.Lock()
+
+
+@dataclass
+class _FFmpegPipe:
+    process: subprocess.Popen
+    stderr_file: Any
+
+    @property
+    def stdin(self):
+        if self.process.stdin is None:
+            raise RuntimeError("FFmpeg stdin 不可用")
+        return self.process.stdin
 
 # ---------------------------------------------------------------
 #  模板加载（带预缩放缓存）
@@ -366,6 +387,271 @@ def build_delete_set(total: int, states: np.ndarray,
     return del_mask
 
 
+def _kept_frame_ranges(to_del: np.ndarray) -> list[tuple[int, int]]:
+    """将删除掩码转换为左闭右开的保留帧区间。"""
+    ranges = []
+    i = 0
+    total = len(to_del)
+    while i < total:
+        if to_del[i]:
+            i += 1
+            continue
+        start = i
+        while i < total and not to_del[i]:
+            i += 1
+        ranges.append((start, i))
+    return ranges
+
+
+def _has_audio_stream(video_path: str) -> bool:
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            result = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=index", "-of", "csv=p=0", video_path],
+                check=False, capture_output=True, text=True, timeout=15,
+                creationflags=_NO_WINDOW)
+            return bool(result.stdout.strip())
+        except Exception:
+            pass
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", video_path,
+             "-map", "0:a:0", "-frames:a", "1", "-f", "null", "-"],
+            check=False, capture_output=True, timeout=15,
+            creationflags=_NO_WINDOW)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _gpu_encoder_probe_args(enc: str) -> list[str]:
+    q = "24"
+    if enc == "h264_nvenc":
+        return ["-c:v", enc, "-preset", "p4", "-cq", q]
+    if enc == "h264_qsv":
+        return ["-c:v", enc, "-global_quality", q]
+    if enc == "h264_amf":
+        return ["-c:v", enc, "-usage", "transcoding", "-quality", "speed",
+                "-rc", "cqp", "-qp_i", q, "-qp_p", q]
+    return ["-c:v", enc]
+
+
+def _gpu_encoder_works(enc: str, timeout: float = 5) -> bool:
+    # 单飞探测：探测全程持锁，避免多线程并发启动多个 ffmpeg 探测同一编码器，
+    # 进而在 GPU 资源紧张时因并发抢占产生假阴性。
+    with _GPU_PROBE_LOCK:
+        cached = _GPU_PROBE_CACHE.get(enc)
+        if cached is not None:
+            return cached
+
+        try:
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=0.1",
+                 *_gpu_encoder_probe_args(enc), "-f", "null", "-"],
+                check=True, capture_output=True, timeout=timeout,
+                creationflags=_NO_WINDOW)
+        except FileNotFoundError:
+            # FFmpeg 不在 PATH：确定不可用，缓存 False。
+            _GPU_PROBE_CACHE[enc] = False
+            return False
+        except subprocess.CalledProcessError:
+            # 编码器确实初始化失败（ffmpeg 正常退出且给出错误）：缓存 False。
+            # 但超时（TimeoutExpired）等瞬时失败不在此分支，不缓存。
+            _GPU_PROBE_CACHE[enc] = False
+            return False
+        except Exception:
+            # 瞬时失败（超时、GPU 被占用、驱动初始化等）：不缓存，下次重新探测，
+            # 避免一次偶发失败永久禁用该编码器。
+            return False
+
+        _GPU_PROBE_CACHE[enc] = True
+        return True
+
+
+def list_ffmpeg_gpu_encoders() -> list[str]:
+    try:
+        output = subprocess.check_output(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            text=True, stderr=subprocess.STDOUT, timeout=10,
+            creationflags=_NO_WINDOW)
+    except Exception:
+        return []
+
+    # 顺序即优先级：nvenc（NVIDIA）通常最快最稳，其次是 qsv（Intel）、amf（AMD）。
+    # 纯 AMD 机型误选不可用 nvenc 的问题（issue #3）已由 _gpu_encoder_works 的实测探测解决，
+    # 不依赖把 amf 提前；探测通过的编码器按此序取首个即可。
+    candidates = ["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox"]
+    return [enc for enc in candidates if enc in output]
+
+
+def list_working_gpu_encoders() -> list[str]:
+    return [enc for enc in list_ffmpeg_gpu_encoders() if _gpu_encoder_works(enc)]
+
+
+def _pick_gpu_encoder() -> str | None:
+    working = list_working_gpu_encoders()
+    return working[0] if working else None
+
+
+def _resolve_gpu_encoder(gpu_encoder: str | None) -> str | None:
+    selected = (gpu_encoder or "").strip()
+    if selected:
+        return selected if _gpu_encoder_works(selected) else None
+    return _pick_gpu_encoder()
+
+
+def _encoder_cmd_args(enc: str, quality: int) -> list[str]:
+    q = max(0, min(10, int(quality)))
+    qp = str(18 + (10 - q))
+    if enc == "h264_nvenc":
+        return ["-c:v", enc, "-preset", "p4", "-cq", qp]
+    if enc == "h264_qsv":
+        return ["-c:v", enc, "-global_quality", qp]
+    if enc == "h264_amf":
+        return ["-c:v", enc, "-usage", "transcoding", "-quality", "speed",
+                "-rc", "cqp", "-qp_i", qp, "-qp_p", qp]
+    return ["-c:v", enc, "-q:v", qp]
+
+
+def _video_encoder_args(quality: int, use_gpu: bool, gpu_encoder: str) -> list[str]:
+    q = max(0, min(10, int(quality)))
+    if use_gpu:
+        enc = _resolve_gpu_encoder(gpu_encoder)
+        if enc:
+            return _encoder_cmd_args(enc, q) + ["-pix_fmt", "yuv420p", "-threads", "0"]
+    crf = int(round(28 - q))
+    return ["-c:v", "libx264", "-crf", str(crf),
+            "-pix_fmt", "yuv420p", "-threads", "0"]
+
+
+def _export_ranges_with_ffmpeg_filters(
+        video_path: str, output_path: str, ranges: list[tuple[int, int]],
+        fps: float, quality: int, use_gpu: bool, gpu_encoder: str,
+        include_audio: bool, progress_cb=None) -> bool:
+    """使用 FFmpeg trim/concat 快速导出左闭右开的帧区间。
+
+    滤镜图通过 -filter_complex_script 写入文件（不走命令行），ffmpeg concat
+    可处理上千段，因此不再对段数设上限；空 ranges 时直接回退逐帧路径。
+    """
+    if not ranges:
+        return False
+
+    has_audio = include_audio and _has_audio_stream(video_path)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        filter_file = os.path.join(tmpdir, "filter.txt")
+        lines = []
+        concat_inputs = []
+        for idx, (start, end) in enumerate(ranges):
+            lines.append(
+                f"[0:v]trim=start_frame={start}:end_frame={end},"
+                f"setpts=PTS-STARTPTS[v{idx}]")
+            concat_inputs.append(f"[v{idx}]")
+            if has_audio:
+                lines.append(
+                    f"[0:a]atrim=start={start / fps:.9f}:end={end / fps:.9f},"
+                    f"asetpts=PTS-STARTPTS[a{idx}]")
+                concat_inputs.append(f"[a{idx}]")
+
+        if has_audio:
+            lines.append(
+                "".join(concat_inputs)
+                + f"concat=n={len(ranges)}:v=1:a=1[outv][outa]")
+        else:
+            lines.append(
+                "".join(concat_inputs)
+                + f"concat=n={len(ranges)}:v=1:a=0[outv]")
+
+        with open(filter_file, "w", encoding="utf-8") as handle:
+            handle.write(";\n".join(lines))
+
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+            "-i", video_path, "-filter_complex_script", filter_file,
+            "-map", "[outv]",
+        ]
+        if has_audio:
+            cmd += ["-map", "[outa]"]
+        cmd += _video_encoder_args(quality, use_gpu, gpu_encoder)
+        cmd += ["-c:a", "aac"] if has_audio else ["-an"]
+        cmd.append(output_path)
+
+        try:
+            if progress_cb:
+                progress_cb(0.01, 0)
+            subprocess.run(cmd, check=True, capture_output=True,
+                           timeout=1800, creationflags=_NO_WINDOW)
+            if progress_cb:
+                progress_cb(1.0, sum(end - start for start, end in ranges))
+            return True
+        except subprocess.CalledProcessError as exc:
+            # 快速滤镜路径失败：删除 ffmpeg 写了一半的输出，回退到逐帧路径。
+            # 同时打印 ffmpeg 的真实 stderr，避免“静默变慢 + 无诊断”。
+            err = (exc.stderr or b"").decode("utf-8", errors="ignore").strip()
+            if err:
+                print(f"[analyzer] 快速滤镜导出失败，回退逐帧路径。ffmpeg stderr: {err}")
+            if os.path.isfile(output_path):
+                os.remove(output_path)
+            return False
+        except Exception as exc:
+            # 超时/其它异常同样回退，但打印原因，不再完全静默。
+            print(f"[analyzer] 快速滤镜导出异常，回退逐帧路径: {exc}")
+            if os.path.isfile(output_path):
+                os.remove(output_path)
+            return False
+
+
+def _mux_audio_for_ranges(video_path: str, video_only_path: str,
+                          output_path: str, ranges: list[tuple[int, int]],
+                          fps: float):
+    if not _has_audio_stream(video_path):
+        os.replace(video_only_path, output_path)
+        return
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        filter_file = os.path.join(tmpdir, "audio-filter.txt")
+        lines = []
+        labels = []
+        for idx, (start, end) in enumerate(ranges):
+            lines.append(
+                f"[0:a]atrim=start={start / fps:.9f}:end={end / fps:.9f},"
+                f"asetpts=PTS-STARTPTS[a{idx}]")
+            labels.append(f"[a{idx}]")
+        lines.append("".join(labels) + f"concat=n={len(ranges)}:v=0:a=1[outa]")
+        with open(filter_file, "w", encoding="utf-8") as handle:
+            handle.write(";\n".join(lines))
+
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+                 "-i", video_path, "-i", video_only_path,
+                 "-filter_complex_script", filter_file,
+                 "-map", "1:v:0", "-map", "[outa]",
+                 "-c:v", "copy", "-c:a", "aac", "-shortest", output_path],
+                check=True, capture_output=True, timeout=1800, creationflags=_NO_WINDOW)
+        except Exception as exc:
+            # 混流失败：删除可能被 ffmpeg 截断/写半的损坏输出，避免残留假成品。
+            if os.path.isfile(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            stderr = b""
+            if isinstance(exc, subprocess.CalledProcessError):
+                stderr = exc.stderr or b""
+            if stderr:
+                raise RuntimeError(
+                    f"音频混流失败: {stderr.decode('utf-8', errors='ignore')}"
+                ) from exc
+            raise
+
+
 def export_video(video_path: str, output_path: str, to_del,
                  fps: float, quality: int, progress_cb=None,
                  use_gpu: bool = False, gpu_encoder: str = ""):
@@ -375,31 +661,49 @@ def export_video(video_path: str, output_path: str, to_del,
     if isinstance(to_del, set):
         mask = np.zeros(total, dtype=bool)
         for idx in to_del:
-            if 0 <= idx < total: mask[idx] = True
+            if 0 <= idx < total:
+                mask[idx] = True
         to_del = mask
+
+    ranges = _kept_frame_ranges(to_del)
+    written_fast = sum(end - start for start, end in ranges)
+    if not ranges:
+        cap.release()
+        raise RuntimeError("没有可导出的帧")
+
+    if shutil.which("ffmpeg") and _export_ranges_with_ffmpeg_filters(
+            video_path, output_path, ranges, fps, quality,
+            use_gpu, gpu_encoder, True, progress_cb):
+        cap.release()
+        return written_fast, total
 
     ret, sample = cap.read()
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    if not ret: raise RuntimeError("无法读取视频帧")
+    if not ret:
+        cap.release()
+        raise RuntimeError("无法读取视频帧")
     h, w = sample.shape[:2]
 
+    use_ffmpeg = bool(shutil.which("ffmpeg"))
+    video_only_path = output_path + ".video-only.tmp.mp4" if use_ffmpeg else output_path
     writer_kind = None
     ffmpeg_proc = None
     writer = None
 
-    if shutil.which("ffmpeg"):
-        ffmpeg_proc = _open_ffmpeg_pipe_writer(output_path, fps, w, h, quality, use_gpu=use_gpu,
-                                               gpu_encoder=gpu_encoder)
+    if use_ffmpeg:
+        ffmpeg_proc = _open_ffmpeg_pipe_writer(
+            video_only_path, fps, w, h, quality,
+            use_gpu=use_gpu, gpu_encoder=gpu_encoder)
         writer_kind = "ffmpeg"
     else:
         try:
             import imageio
-            writer = imageio.get_writer(output_path, fps=fps, codec='libx264',
+            writer = imageio.get_writer(video_only_path, fps=fps, codec='libx264',
                                         quality=quality, pixelformat='yuv420p')
             writer_kind = "imageio"
         except ImportError:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+            writer = cv2.VideoWriter(video_only_path, fourcc, fps, (w, h))
             writer_kind = "cv2"
 
     written = 0
@@ -420,23 +724,47 @@ def export_video(video_path: str, output_path: str, to_del,
                 continue
 
             ret, frame = cap.read()
-            if not ret: break
-
+            if not ret:
+                break
             if writer_kind == "ffmpeg":
+                if ffmpeg_proc is None:
+                    raise RuntimeError("FFmpeg 写入器未初始化")
                 ffmpeg_proc.stdin.write(frame.tobytes())
             elif writer_kind == "imageio":
+                if writer is None:
+                    raise RuntimeError("imageio 写入器未初始化")
                 writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             else:
+                if writer is None:
+                    raise RuntimeError("OpenCV 写入器未初始化")
                 writer.write(frame)
             written += 1
             idx += 1
-
             if progress_cb and written % 60 == 0:
                 progress_cb(idx / total, written)
     finally:
-        _close_video_writer(writer_kind, writer, ffmpeg_proc)
+        cap.release()
+        try:
+            _close_video_writer(writer_kind, writer, ffmpeg_proc)
+        except Exception:
+            # 编码器关闭失败（ffmpeg 非零退出/超时）：仍需清理临时文件再向上抛错。
+            if use_ffmpeg and video_only_path != output_path and os.path.isfile(video_only_path):
+                try:
+                    os.remove(video_only_path)
+                except OSError:
+                    pass
+            raise
 
-    cap.release()
+    if use_ffmpeg:
+        try:
+            _mux_audio_for_ranges(video_path, video_only_path, output_path, ranges, fps)
+        finally:
+            # 混流结束（无论成功失败）都要回收 video-only 临时文件。
+            if video_only_path != output_path and os.path.isfile(video_only_path):
+                try:
+                    os.remove(video_only_path)
+                except OSError:
+                    pass
     return written, total
 
 
@@ -446,56 +774,29 @@ def export_ranges(video_path: str, output_path: str, ranges: list,
     if not ranges:
         return 0, 0
 
-    if len(ranges) == 1 and shutil.which("ffmpeg"):
-        s, e = ranges[0]
-        frames = e - s + 1
-        start_sec = s / fps
-        q = max(0, min(10, int(quality)))
-        crf = int(round(28 - q))
-
-        cmd = ["ffmpeg", "-y", "-ss", f"{start_sec:.4f}", "-i", video_path, "-frames:v", str(frames)]
-
-        enc = gpu_encoder if (use_gpu and gpu_encoder) else (_pick_gpu_encoder() if use_gpu else None)
-        if enc == "h264_nvenc":
-            cmd += ["-c:v", enc, "-preset", "p4", "-cq", str(18 + (10 - q))]
-        elif enc == "h264_qsv":
-            cmd += ["-c:v", enc, "-global_quality", str(18 + (10 - q))]
-        elif enc:
-            cmd += ["-c:v", enc, "-q:v", str(18 + (10 - q))]
-        else:
-            cmd += ["-c:v", "libx264", "-crf", str(crf)]
-
-        cmd += ["-an", "-pix_fmt", "yuv420p", output_path]
-
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if progress_cb: progress_cb(1.0, frames)
-            return frames, frames
-        except subprocess.CalledProcessError:
-            pass
+    exclusive_ranges = [(start, end + 1) for start, end in ranges]
+    total_frames_to_export = sum(end - start for start, end in exclusive_ranges)
+    if shutil.which("ffmpeg") and _export_ranges_with_ffmpeg_filters(
+            video_path, output_path, exclusive_ranges, fps, quality,
+            use_gpu, gpu_encoder, False, progress_cb):
+        return total_frames_to_export, total_frames_to_export
 
     cap = cv2.VideoCapture(video_path)
-    total_frames_to_export = sum(e - s + 1 for s, e in ranges)
-    if total_frames_to_export <= 0:
-        cap.release()
-        return 0, 0
-
     cap.set(cv2.CAP_PROP_POS_FRAMES, ranges[0][0])
     ret, sample = cap.read()
     if not ret:
         cap.release()
         raise RuntimeError("无法读取视频帧")
     h, w = sample.shape[:2]
-
     cap.set(cv2.CAP_PROP_POS_FRAMES, ranges[0][0])
 
     writer_kind = None
     ffmpeg_proc = None
     writer = None
-
     if shutil.which("ffmpeg"):
-        ffmpeg_proc = _open_ffmpeg_pipe_writer(output_path, fps, w, h, quality, use_gpu=use_gpu,
-                                               gpu_encoder=gpu_encoder)
+        ffmpeg_proc = _open_ffmpeg_pipe_writer(
+            output_path, fps, w, h, quality,
+            use_gpu=use_gpu, gpu_encoder=gpu_encoder)
         writer_kind = "ffmpeg"
     else:
         try:
@@ -510,44 +811,32 @@ def export_ranges(video_path: str, output_path: str, ranges: list,
 
     written = 0
     try:
-        for s, e in ranges:
-            cur_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-            if cur_pos != s:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, s)
-
-            for i in range(s, e + 1):
+        for start, end in ranges:
+            if int(cap.get(cv2.CAP_PROP_POS_FRAMES)) != start:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            for _ in range(start, end + 1):
                 ret, frame = cap.read()
-                if not ret: break
-
+                if not ret:
+                    break
                 if writer_kind == "ffmpeg":
+                    if ffmpeg_proc is None:
+                        raise RuntimeError("FFmpeg 写入器未初始化")
                     ffmpeg_proc.stdin.write(frame.tobytes())
                 elif writer_kind == "imageio":
+                    if writer is None:
+                        raise RuntimeError("imageio 写入器未初始化")
                     writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 else:
+                    if writer is None:
+                        raise RuntimeError("OpenCV 写入器未初始化")
                     writer.write(frame)
-
                 written += 1
                 if progress_cb and written % 30 == 0:
                     progress_cb(written / total_frames_to_export, written)
     finally:
+        cap.release()
         _close_video_writer(writer_kind, writer, ffmpeg_proc)
-
-    cap.release()
     return written, total_frames_to_export
-
-
-def _pick_gpu_encoder() -> str | None:
-    try:
-        out = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-encoders"],
-            text=True, stderr=subprocess.STDOUT)
-    except Exception:
-        return None
-
-    candidates = ["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox"]
-    for enc in candidates:
-        if enc in out: return enc
-    return None
 
 
 def _open_ffmpeg_pipe_writer(output_path: str, fps: float, w: int, h: int, quality: int, use_gpu: bool,
@@ -555,30 +844,60 @@ def _open_ffmpeg_pipe_writer(output_path: str, fps: float, w: int, h: int, quali
     q = max(0, min(10, int(quality)))
     crf = int(round(28 - q))
     base_cmd = [
-        "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
         "-s", f"{w}x{h}", "-r", f"{fps}", "-i", "-", "-an",
     ]
 
     if use_gpu:
-        enc = gpu_encoder if gpu_encoder else _pick_gpu_encoder()
+        enc = _resolve_gpu_encoder(gpu_encoder)
         if enc:
-            if enc == "h264_nvenc":
-                cmd = base_cmd + ["-c:v", enc, "-preset", "p4", "-cq", str(18 + (10 - q)), output_path]
-            elif enc == "h264_qsv":
-                cmd = base_cmd + ["-c:v", enc, "-global_quality", str(18 + (10 - q)), output_path]
-            else:
-                cmd = base_cmd + ["-c:v", enc, "-q:v", str(18 + (10 - q)), output_path]
-            return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            cmd = base_cmd + _encoder_cmd_args(enc, q) + ["-pix_fmt", "yuv420p", output_path]
+            return _spawn_ffmpeg_pipe(cmd)
 
     cmd = base_cmd + ["-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", output_path]
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    return _spawn_ffmpeg_pipe(cmd)
+
+
+def _spawn_ffmpeg_pipe(cmd: list[str]):
+    stderr_file = tempfile.TemporaryFile()
+    try:
+        process = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stderr=stderr_file,
+            creationflags=_NO_WINDOW)
+    except Exception:
+        stderr_file.close()
+        raise
+    return _FFmpegPipe(process, stderr_file)
 
 
 def _close_video_writer(writer_kind, writer, ffmpeg_proc):
     if writer_kind == "ffmpeg" and ffmpeg_proc:
-        ffmpeg_proc.stdin.close()
-        _, err = ffmpeg_proc.communicate()
-        if ffmpeg_proc.returncode != 0:
+        try:
+            ffmpeg_proc.stdin.close()
+        except OSError:
+            pass
+        stderr_file = ffmpeg_proc.stderr_file
+        timed_out = False
+        try:
+            returncode = ffmpeg_proc.process.wait(timeout=1800)
+        except subprocess.TimeoutExpired:
+            # 超时：发 kill 后再限时回收，避免 kill 仍不返回时无限阻塞。
+            ffmpeg_proc.process.kill()
+            try:
+                returncode = ffmpeg_proc.process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                # 进程拒绝退出：不再死等，按超时处理并尽量回收 stderr。
+                returncode = -1
+            timed_out = True
+        try:
+            stderr_file.seek(0)
+            err = stderr_file.read()
+        finally:
+            stderr_file.close()
+        if timed_out:
+            raise RuntimeError("ffmpeg 编码超时")
+        if returncode != 0:
             raise RuntimeError(f"ffmpeg 编码失败: {err.decode('utf-8', errors='ignore')}")
     elif writer_kind == "imageio" and writer:
         writer.close()
