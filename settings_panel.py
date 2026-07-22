@@ -89,7 +89,7 @@ class SettingsPanel(ttk.LabelFrame):
         )
         ttk.Label(
             tab_basic,
-            text="auto=PATH/imageio_ffmpeg；仅 A_PT 使用",
+            text="auto=PATH/imageio_ffmpeg；分析与导出/GPU 探测共用",
             foreground="#666666",
         ).grid(row=sep_r + 7, column=0, columnspan=2, sticky=tk.W)
 

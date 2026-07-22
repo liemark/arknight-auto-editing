@@ -524,20 +524,23 @@ class VideoPreviewPlayer(tk.Frame):
 
             decode_backend = p.get('decode_backend', 'opencv')
             ffmpeg_path = p.get('ffmpeg_path')
+            backend_note = ""
             try:
                 backend_key = analyzer.normalize_decode_backend(decode_backend)
-            except Exception:
+            except Exception as norm_exc:
                 backend_key = 'opencv'
+                backend_note = f"（设置无效，已回退 OpenCV：{norm_exc}）"
             backend_label = {
                 'opencv': 'OpenCV',
                 'ffmpeg_sw_passthrough': 'FFmpeg A_PT',
-            }.get(backend_key, backend_key)
+            }.get(backend_key, backend_key) + backend_note
 
             def prog(r):
+                label = backend_label.split('（')[0]
                 self.after(
                     0,
                     lambda: self.btn_analyze.config(
-                        text=f"{backend_label} 匹配/分析 {int(r * 100)}%"
+                        text=f"{label} 匹配/分析 {int(r * 100)}%"
                     ),
                 )
 
@@ -546,6 +549,8 @@ class VideoPreviewPlayer(tk.Frame):
                 f"ffmpeg_path={ffmpeg_path or 'auto'} "
                 f"proc_res={proc_res} video={self.video_path}"
             )
+            if backend_note:
+                print(f"[analyze] {backend_note}", flush=True)
             try:
                 states, diffs, context = analyzer.analyze_video_with_context(
                     self.video_path, configs, p['thresholds'],
@@ -569,21 +574,21 @@ class VideoPreviewPlayer(tk.Frame):
                 )
                 return
 
-            used_ctx = bool(
-                isinstance(context, dict)
-                and context.get("complete") is True
-                and context.get("pause_boundary_diffs") is not None
-            )
-            print(
-                f"[analyze] context complete={context.get('complete') if isinstance(context, dict) else None} "
-                f"pause_boundary_records="
-                f"{len(context.get('pause_boundary_diffs') or []) if isinstance(context, dict) else 0} "
-                f"will_try_skip_second_scan={used_ctx}"
-            )
-
             pauses, speeds = analyzer.build_segments(
                 states, diffs, self.video_path, proc_res, p['compare'], self.fps, prog,
                 analysis_context=context,
+            )
+            # Same predicate build_segments uses (not a looser complete-only check).
+            used_ctx = analyzer.analysis_context_skips_second_scan(
+                context, pauses, len(states)
+            )
+            print(
+                f"[analyze] context complete={context.get('complete') if isinstance(context, dict) else None} "
+                f"L={len(states)} "
+                f"pause_boundary_records="
+                f"{len(context.get('pause_boundary_diffs') or []) if isinstance(context, dict) else 0} "
+                f"skip_second_scan={used_ctx}",
+                flush=True,
             )
 
             # 把 diffs 一并传给完成函数以持久化

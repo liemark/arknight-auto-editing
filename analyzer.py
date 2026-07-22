@@ -157,10 +157,12 @@ class _BoundaryTracker:
 
     Keeps at most two small gray frames: prev_gray (also used for diffs) and
     the open pause run's before-gray. Never grows with video duration.
+
+    Logical length is always the *decoded* frame count L, not container
+    metadata M. finish_with_last(decoded=L) must be used for EOF.
     """
 
-    def __init__(self, total: int):
-        self._total = int(total)
+    def __init__(self):
         self.records: list[dict] = []
         self._open_start: int | None = None
         self._before_gray: np.ndarray | None = None
@@ -178,20 +180,30 @@ class _BoundaryTracker:
             if is_pause:
                 self._open_start = idx
                 # before = max(0, start-1): previous gray, or this frame if start==0
-                self._before_gray = gray if idx == 0 else prev_gray
+                src = gray if idx == 0 else prev_gray
+                self._before_gray = None if src is None else np.ascontiguousarray(src).copy()
         elif not is_pause:
             self._close_run(end=idx - 1, after_idx=idx, after_gray=gray)
 
     def finish_with_last(self, decoded: int, last_gray: np.ndarray | None) -> None:
+        """Close a run still open at end-of-stream using logical length L=decoded."""
         if self._open_start is None:
             return
-        end = decoded - 1
-        after_idx = min(self._total - 1, end + 1)
+        if decoded <= 0:
+            self._open_start = None
+            self._before_gray = None
+            self._skipped_records += 1
+            return
+        end = int(decoded) - 1
+        # Logical total L = decoded. Same formula as build_segments:
+        # after_idx = min(L - 1, end + 1). When pause reaches last frame,
+        # after_idx == end and we close with last_gray.
+        after_idx = min(int(decoded) - 1, end + 1)
         if after_idx <= end:
             if last_gray is not None:
                 self._close_run(end=end, after_idx=after_idx, after_gray=last_gray)
                 return
-        # Early EOF / missing after frame → context incomplete
+        # Missing after frame → context incomplete
         self._open_start = None
         self._before_gray = None
         self._skipped_records += 1
@@ -223,13 +235,15 @@ class _BoundaryTracker:
 
 
 def _make_analysis_context(
-    total: int, decoded: int, records: list[dict], complete: bool
+    logical_len: int, records: list[dict], complete: bool
 ) -> dict:
+    """logical_len L = len(states) after trim (= decoded). Not container metadata."""
+    L = int(logical_len)
     return {
         "version": ANALYSIS_CONTEXT_VERSION,
         "complete": bool(complete),
-        "frame_count": int(total),
-        "decoded_frame_count": int(decoded),
+        "frame_count": L,
+        "decoded_frame_count": L,
         "pause_boundary_diffs": list(records),
     }
 
@@ -238,6 +252,7 @@ def context_records_for_pauses(analysis_context, pauses: list, total: int):
     """Return records if the whole context is usable; else None.
 
     All-or-nothing: never mix cached and rescanned boundaries.
+    `total` must be len(states) (logical length L).
     """
     if not isinstance(analysis_context, dict):
         return None
@@ -246,9 +261,10 @@ def context_records_for_pauses(analysis_context, pauses: list, total: int):
             return None
         if analysis_context.get("complete") is not True:
             return None
-        if int(analysis_context.get("frame_count", -1)) != int(total):
+        L = int(total)
+        if int(analysis_context.get("frame_count", -1)) != L:
             return None
-        if int(analysis_context.get("decoded_frame_count", -1)) != int(total):
+        if int(analysis_context.get("decoded_frame_count", -1)) != L:
             return None
         records = analysis_context.get("pause_boundary_diffs")
         if not isinstance(records, list) or len(records) != len(pauses):
@@ -261,13 +277,20 @@ def context_records_for_pauses(analysis_context, pauses: list, total: int):
             diff = float(rec["diff"])
             if start != int(p["start"]) or end != int(p["end"]):
                 return None
-            if before != max(0, start - 1) or after != min(int(total) - 1, end + 1):
+            if before != max(0, start - 1) or after != min(L - 1, end + 1):
                 return None
             if not np.isfinite(diff):
                 return None
     except (KeyError, TypeError, ValueError):
         return None
     return records
+
+
+def analysis_context_skips_second_scan(analysis_context, pauses: list, total: int) -> bool:
+    """True when build_segments would skip the second VideoCapture scan."""
+    if not pauses:
+        return True
+    return context_records_for_pauses(analysis_context, pauses, total) is not None
 
 
 def _finalize_analysis_arrays(
@@ -278,18 +301,24 @@ def _finalize_analysis_arrays(
     tracker: _BoundaryTracker | None,
     last_gray: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
-    if decoded < allocated_total:
+    """Trim to decoded length L; complete does NOT require L == metadata M."""
+    if decoded < len(states):
         states = states[:decoded]
         diffs = diffs[:decoded]
-    if tracker is not None:
-        tracker.finish_with_last(decoded, last_gray)
-        complete = decoded == allocated_total and tracker.skipped == 0
-        # frame_count for consumers is the states length after trim
-        context = _make_analysis_context(
-            len(states), decoded, tracker.records, complete
+    L = int(decoded)
+    if allocated_total > 0 and L < int(allocated_total):
+        print(
+            f"[analyze] logical length L={L} < container metadata M={int(allocated_total)} "
+            f"(using L for context completeness)",
+            flush=True,
         )
+    if tracker is not None:
+        # Finish against logical length L, not container metadata.
+        tracker.finish_with_last(L, last_gray)
+        complete = tracker.skipped == 0 and L > 0
+        context = _make_analysis_context(L, tracker.records, complete)
     else:
-        context = _make_analysis_context(len(states), decoded, [], False)
+        context = _make_analysis_context(L, [], False)
     return states, diffs, context
 
 
@@ -406,13 +435,13 @@ def _analyze_video_opencv(
     diffs = np.zeros(max(0, total), dtype=np.float32)
     n_workers = min(n_threads, multiprocessing.cpu_count())
     pw, ph = proc_res
-    tracker = _BoundaryTracker(total if total > 0 else 1) if want_context else None
+    tracker = _BoundaryTracker() if want_context else None
     # If total unknown/0, still allow reading until EOF with growable lists.
     use_dynamic = total <= 0
     if use_dynamic:
         states_list: list[int] = []
         diffs_list: list[float] = []
-        tracker = _BoundaryTracker(10**9) if want_context else None
+        tracker = _BoundaryTracker() if want_context else None
 
     with concurrent.futures.ProcessPoolExecutor(
             max_workers=n_workers,
@@ -525,7 +554,7 @@ def _analyze_video_ffmpeg_sw_passthrough(
     states = np.zeros(total, dtype=np.int8)
     diffs = np.zeros(total, dtype=np.float32)
     n_workers = min(n_threads, multiprocessing.cpu_count())
-    tracker = _BoundaryTracker(total) if want_context else None
+    tracker = _BoundaryTracker() if want_context else None
 
     stderr_file = tempfile.TemporaryFile()
     proc: subprocess.Popen | None = None
@@ -726,7 +755,7 @@ def analyze_video_with_context(
             progress_cb,
             want_context=True,
         )
-        return states, diffs, context or _make_analysis_context(len(states), len(states), [], False)
+        return states, diffs, context or _make_analysis_context(len(states), [], False)
     if backend == DECODE_BACKEND_FFMPEG_SW_PASSTHROUGH:
         states, diffs, context = _analyze_video_ffmpeg_sw_passthrough(
             video_path,
@@ -739,7 +768,7 @@ def analyze_video_with_context(
             ffmpeg_path=ffmpeg_path,
             want_context=True,
         )
-        return states, diffs, context or _make_analysis_context(len(states), len(states), [], False)
+        return states, diffs, context or _make_analysis_context(len(states), [], False)
     raise ValueError(f"unsupported decode_backend={backend!r}")
 
 
