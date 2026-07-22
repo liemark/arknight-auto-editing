@@ -522,22 +522,92 @@ class VideoPreviewPlayer(tk.Frame):
             if loaded == 0:
                 self.after(0, lambda: messagebox.showwarning("模板缺失", "未找到可用模板，将标记所有帧为普通帧。"))
 
-            def prog(r):
-                self.after(0, lambda: self.btn_analyze.config(text=f"匹配/分析 {int(r * 100)}%"))
+            decode_backend = p.get('decode_backend', 'opencv')
+            ffmpeg_path = p.get('ffmpeg_path')
+            try:
+                backend_key = analyzer.normalize_decode_backend(decode_backend)
+            except Exception:
+                backend_key = 'opencv'
+            backend_label = {
+                'opencv': 'OpenCV',
+                'ffmpeg_sw_passthrough': 'FFmpeg A_PT',
+            }.get(backend_key, backend_key)
 
-            states, diffs = analyzer.analyze_video(
-                self.video_path, configs, p['thresholds'],
-                proc_res, p['batch'], p['threads'], prog)
+            def prog(r):
+                self.after(
+                    0,
+                    lambda: self.btn_analyze.config(
+                        text=f"{backend_label} 匹配/分析 {int(r * 100)}%"
+                    ),
+                )
+
+            print(
+                f"[analyze] decode_backend={backend_key} "
+                f"ffmpeg_path={ffmpeg_path or 'auto'} "
+                f"proc_res={proc_res} video={self.video_path}"
+            )
+            try:
+                states, diffs, context = analyzer.analyze_video_with_context(
+                    self.video_path, configs, p['thresholds'],
+                    proc_res, p['batch'], p['threads'], prog,
+                    decode_backend=backend_key,
+                    ffmpeg_path=ffmpeg_path,
+                )
+            except Exception as exc:
+                self.after(
+                    0,
+                    lambda: (
+                        self.btn_analyze.config(state=tk.NORMAL, text="自动模板分析"),
+                        messagebox.showerror(
+                            "分析失败",
+                            f"解码后端 {backend_label} 失败:\n{type(exc).__name__}: {exc}\n\n"
+                            f"可改回 OpenCV（默认）后重试。",
+                        ),
+                    ),
+                )
+                return
+
+            used_ctx = bool(
+                isinstance(context, dict)
+                and context.get("complete") is True
+                and context.get("pause_boundary_diffs") is not None
+            )
+            print(
+                f"[analyze] context complete={context.get('complete') if isinstance(context, dict) else None} "
+                f"pause_boundary_records="
+                f"{len(context.get('pause_boundary_diffs') or []) if isinstance(context, dict) else 0} "
+                f"will_try_skip_second_scan={used_ctx}"
+            )
 
             pauses, speeds = analyzer.build_segments(
-                states, diffs, self.video_path, proc_res, p['compare'], self.fps, prog)
+                states, diffs, self.video_path, proc_res, p['compare'], self.fps, prog,
+                analysis_context=context,
+            )
 
             # 把 diffs 一并传给完成函数以持久化
-            self.after(0, lambda: self._finish_analysis(states, diffs, pauses, speeds))
+            self.after(
+                0,
+                lambda: self._finish_analysis(
+                    states,
+                    diffs,
+                    pauses,
+                    speeds,
+                    backend_label=backend_label,
+                    context_used=used_ctx,
+                ),
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_analysis(self, states, diffs, pauses, speeds):
+    def _finish_analysis(
+        self,
+        states,
+        diffs,
+        pauses,
+        speeds,
+        backend_label: str = "OpenCV",
+        context_used: bool = False,
+    ):
         from tkinter import messagebox
         self.states_array = states
         self.diffs_array = diffs  # 储存 diffs
@@ -555,7 +625,17 @@ class VideoPreviewPlayer(tk.Frame):
         self.timeline.mark_dirty()
         self.btn_analyze.config(state=tk.NORMAL, text="自动模板分析")
         self.timeline.redraw()
-        messagebox.showinfo("分析完成", f"识别到 {len(pauses)} 处暂停，{len(speeds)} 个变速区间。")
+        boundary_note = (
+            "边界: 第一遍上下文（已跳过二次扫片）"
+            if context_used
+            else "边界: 回退二次扫片或无暂停"
+        )
+        messagebox.showinfo(
+            "分析完成",
+            f"解码后端: {backend_label}\n"
+            f"{boundary_note}\n"
+            f"识别到 {len(pauses)} 处暂停，{len(speeds)} 个变速区间。",
+        )
 
     @staticmethod
     def _build_clip_segments(pauses: list, total_frames: int) -> list:

@@ -65,10 +65,41 @@ class SettingsPanel(ttk.LabelFrame):
         ttk.Separator(tab_basic, orient=tk.HORIZONTAL).grid(
             row=sep_r + 4, column=0, columnspan=2, sticky=tk.EW, pady=4)
 
+        # Decode backend for template analysis (preview/export still use OpenCV).
+        # Default remains OpenCV; ffmpeg_sw_passthrough is the verified A_PT path.
+        self.decode_backend_var = tk.StringVar(value="OpenCV（默认）")
+        ttk.Label(tab_basic, text="分析解码后端:").grid(row=sep_r + 5, column=0, sticky=tk.W, pady=2)
+        self.decode_backend_combo = ttk.Combobox(
+            tab_basic,
+            textvariable=self.decode_backend_var,
+            state="readonly",
+            width=22,
+            values=(
+                "OpenCV（默认）",
+                "FFmpeg软件 A_PT（实验）",
+            ),
+        )
+        self.decode_backend_combo.grid(row=sep_r + 5, column=1, sticky=tk.W, padx=4)
+        self.decode_backend_combo.current(0)
+
+        self.ffmpeg_path_var = tk.StringVar(value="auto")
+        ttk.Label(tab_basic, text="FFmpeg 路径:").grid(row=sep_r + 6, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(tab_basic, textvariable=self.ffmpeg_path_var, width=18).grid(
+            row=sep_r + 6, column=1, sticky=tk.W, padx=4
+        )
+        ttk.Label(
+            tab_basic,
+            text="auto=PATH/imageio_ffmpeg；仅 A_PT 使用",
+            foreground="#666666",
+        ).grid(row=sep_r + 7, column=0, columnspan=2, sticky=tk.W)
+
+        ttk.Separator(tab_basic, orient=tk.HORIZONTAL).grid(
+            row=sep_r + 8, column=0, columnspan=2, sticky=tk.EW, pady=4)
+
         self.key_repeat_speed_var = tk.IntVar(value=30)
-        ttk.Label(tab_basic, text="←→ 连续移动速度\n(帧/秒):").grid(row=sep_r + 5, column=0, sticky=tk.W, pady=2)
+        ttk.Label(tab_basic, text="←→ 连续移动速度\n(帧/秒):").grid(row=sep_r + 9, column=0, sticky=tk.W, pady=2)
         ttk.Spinbox(tab_basic, from_=1, to=120, textvariable=self.key_repeat_speed_var, width=7).grid(
-            row=sep_r + 5, column=1, sticky=tk.W, padx=4)
+            row=sep_r + 9, column=1, sticky=tk.W, padx=4)
 
         # ---- 匹配阈值 ----
         self.thr_pause_var = tk.DoubleVar(value=0.7)
@@ -331,7 +362,15 @@ class SettingsPanel(ttk.LabelFrame):
         threading.Thread(target=worker, daemon=True).start()
         self.after(100, poll_result)
 
+    def _decode_backend_key(self) -> str:
+        label = (self.decode_backend_var.get() or "").strip()
+        if "A_PT" in label or "FFmpeg" in label or "ffmpeg" in label.lower():
+            return "ffmpeg_sw_passthrough"
+        return "opencv"
+
     def get_params(self) -> dict:
+        ffmpeg_raw = (self.ffmpeg_path_var.get() or "auto").strip()
+        ffmpeg_path = None if ffmpeg_raw.lower() in ("", "auto") else ffmpeg_raw
         return {
             'batch': self.batch_size_var.get(),
             'proc_res': (self.proc_w_var.get(), self.proc_h_var.get()),
@@ -340,6 +379,8 @@ class SettingsPanel(ttk.LabelFrame):
             'speedup_02': self.speedup_02x_var.get(),
             'speedup_02_factor': self.speedup_02x_factor_var.get(),
             'key_repeat_speed': self.key_repeat_speed_var.get(),
+            'decode_backend': self._decode_backend_key(),
+            'ffmpeg_path': ffmpeg_path,
             'thresholds': {
                 'pause': self.thr_pause_var.get(),
                 'speed_1x': self.thr_1x_var.get(),
