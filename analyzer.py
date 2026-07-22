@@ -570,11 +570,16 @@ def _analyze_video_ffmpeg_sw_passthrough(
                 batch_grays = []
                 batch_indices = []
                 batch_prev = []
+                eof = False
                 for _ in range(batch_n):
                     raw = _read_exact(proc.stdout, bpf)
+                    if len(raw) == 0:
+                        # Clean EOF: CAP_PROP_FRAME_COUNT is often slightly high.
+                        eof = True
+                        break
                     if len(raw) != bpf:
                         raise RuntimeError(
-                            f"FFmpeg A_PT early EOF at frame {got}/{total}; "
+                            f"FFmpeg A_PT partial frame at index {got}/{total}; "
                             f"got_bytes={len(raw)} expected={bpf}; "
                             f"stderr={_stderr_tail()[:500]}"
                         )
@@ -588,14 +593,22 @@ def _analyze_video_ffmpeg_sw_passthrough(
                     last_gray = gray
                     got += 1
 
-                chunk = max(4, len(batch_grays) // (n_workers * 2))
-                results = list(ex.map(_worker_classify_gray, batch_grays, chunksize=chunk))
-                for i, s, g, pg in zip(batch_indices, results, batch_grays, batch_prev):
-                    states[i] = s
-                    if tracker is not None:
-                        tracker.observe(i, g, int(s), pg)
-                if progress_cb:
-                    progress_cb((got / total) * 0.5)
+                if batch_grays:
+                    chunk = max(4, len(batch_grays) // (n_workers * 2))
+                    results = list(
+                        ex.map(_worker_classify_gray, batch_grays, chunksize=chunk)
+                    )
+                    for i, s, g, pg in zip(
+                        batch_indices, results, batch_grays, batch_prev
+                    ):
+                        states[i] = s
+                        if tracker is not None:
+                            tracker.observe(i, g, int(s), pg)
+                    if progress_cb:
+                        progress_cb((got / total) * 0.5)
+
+                if eof:
+                    break
 
         # Drain/wait FFmpeg
         try:
@@ -608,13 +621,21 @@ def _analyze_video_ffmpeg_sw_passthrough(
             proc.kill()
             proc.wait()
             raise TimeoutError("FFmpeg A_PT did not exit after stdout closed")
-        if rc not in (0, None):
-            # Some builds return non-zero after delivering all frames; only hard-fail
-            # if we did not get a full frame count.
-            if got != total:
-                raise RuntimeError(
-                    f"FFmpeg A_PT exit={rc} after {got}/{total} frames; stderr={_stderr_tail()[:500]}"
-                )
+        if got == 0:
+            raise RuntimeError(
+                f"FFmpeg A_PT produced 0 frames; exit={rc}; stderr={_stderr_tail()[:500]}"
+            )
+        if got < total:
+            # Metadata overstated frame count (common). Accept actual stream length.
+            print(
+                f"[analyze] A_PT decoded {got}/{total} frames "
+                f"(container metadata may overstate FRAME_COUNT); exit={rc}",
+                flush=True,
+            )
+        elif rc not in (0, None) and got != total:
+            raise RuntimeError(
+                f"FFmpeg A_PT exit={rc} after {got}/{total} frames; stderr={_stderr_tail()[:500]}"
+            )
     finally:
         if proc is not None:
             try:
@@ -947,7 +968,7 @@ def _kept_frame_ranges(to_del: np.ndarray) -> list[tuple[int, int]]:
     return ranges
 
 
-def _has_audio_stream(video_path: str) -> bool:
+def _has_audio_stream(video_path: str, ffmpeg_path: str | None = None) -> bool:
     ffprobe = shutil.which("ffprobe")
     if ffprobe:
         try:
@@ -960,8 +981,9 @@ def _has_audio_stream(video_path: str) -> bool:
         except Exception:
             pass
 
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
+    try:
+        ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
+    except FileNotFoundError:
         return False
     try:
         result = subprocess.run(
@@ -986,43 +1008,51 @@ def _gpu_encoder_probe_args(enc: str) -> list[str]:
     return ["-c:v", enc]
 
 
-def _gpu_encoder_works(enc: str, timeout: float = 5) -> bool:
+def _gpu_encoder_works(enc: str, timeout: float = 5, ffmpeg_path: str | None = None) -> bool:
     # 单飞探测：探测全程持锁，避免多线程并发启动多个 ffmpeg 探测同一编码器，
     # 进而在 GPU 资源紧张时因并发抢占产生假阴性。
     with _GPU_PROBE_LOCK:
-        cached = _GPU_PROBE_CACHE.get(enc)
+        cache_key = f"{enc}|{ffmpeg_path or ''}"
+        cached = _GPU_PROBE_CACHE.get(cache_key)
         if cached is not None:
             return cached
 
         try:
+            ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
+        except FileNotFoundError:
+            _GPU_PROBE_CACHE[cache_key] = False
+            return False
+
+        try:
             subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                [ffmpeg, "-hide_banner", "-loglevel", "error",
                  "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=0.1",
                  *_gpu_encoder_probe_args(enc), "-f", "null", "-"],
                 check=True, capture_output=True, timeout=timeout,
                 creationflags=_NO_WINDOW)
         except FileNotFoundError:
             # FFmpeg 不在 PATH：确定不可用，缓存 False。
-            _GPU_PROBE_CACHE[enc] = False
+            _GPU_PROBE_CACHE[cache_key] = False
             return False
         except subprocess.CalledProcessError:
             # 编码器确实初始化失败（ffmpeg 正常退出且给出错误）：缓存 False。
             # 但超时（TimeoutExpired）等瞬时失败不在此分支，不缓存。
-            _GPU_PROBE_CACHE[enc] = False
+            _GPU_PROBE_CACHE[cache_key] = False
             return False
         except Exception:
             # 瞬时失败（超时、GPU 被占用、驱动初始化等）：不缓存，下次重新探测，
             # 避免一次偶发失败永久禁用该编码器。
             return False
 
-        _GPU_PROBE_CACHE[enc] = True
+        _GPU_PROBE_CACHE[cache_key] = True
         return True
 
 
-def list_ffmpeg_gpu_encoders() -> list[str]:
+def list_ffmpeg_gpu_encoders(ffmpeg_path: str | None = None) -> list[str]:
     try:
+        ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
         output = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-encoders"],
+            [ffmpeg, "-hide_banner", "-encoders"],
             text=True, stderr=subprocess.STDOUT, timeout=10,
             creationflags=_NO_WINDOW)
     except Exception:
@@ -1035,20 +1065,26 @@ def list_ffmpeg_gpu_encoders() -> list[str]:
     return [enc for enc in candidates if enc in output]
 
 
-def list_working_gpu_encoders() -> list[str]:
-    return [enc for enc in list_ffmpeg_gpu_encoders() if _gpu_encoder_works(enc)]
+def list_working_gpu_encoders(ffmpeg_path: str | None = None) -> list[str]:
+    return [
+        enc
+        for enc in list_ffmpeg_gpu_encoders(ffmpeg_path)
+        if _gpu_encoder_works(enc, ffmpeg_path=ffmpeg_path)
+    ]
 
 
-def _pick_gpu_encoder() -> str | None:
-    working = list_working_gpu_encoders()
+def _pick_gpu_encoder(ffmpeg_path: str | None = None) -> str | None:
+    working = list_working_gpu_encoders(ffmpeg_path)
     return working[0] if working else None
 
 
-def _resolve_gpu_encoder(gpu_encoder: str | None) -> str | None:
+def _resolve_gpu_encoder(
+    gpu_encoder: str | None, ffmpeg_path: str | None = None
+) -> str | None:
     selected = (gpu_encoder or "").strip()
     if selected:
-        return selected if _gpu_encoder_works(selected) else None
-    return _pick_gpu_encoder()
+        return selected if _gpu_encoder_works(selected, ffmpeg_path=ffmpeg_path) else None
+    return _pick_gpu_encoder(ffmpeg_path)
 
 
 def _encoder_cmd_args(enc: str, quality: int) -> list[str]:
@@ -1064,10 +1100,15 @@ def _encoder_cmd_args(enc: str, quality: int) -> list[str]:
     return ["-c:v", enc, "-q:v", qp]
 
 
-def _video_encoder_args(quality: int, use_gpu: bool, gpu_encoder: str) -> list[str]:
+def _video_encoder_args(
+    quality: int,
+    use_gpu: bool,
+    gpu_encoder: str,
+    ffmpeg_path: str | None = None,
+) -> list[str]:
     q = max(0, min(10, int(quality)))
     if use_gpu:
-        enc = _resolve_gpu_encoder(gpu_encoder)
+        enc = _resolve_gpu_encoder(gpu_encoder, ffmpeg_path=ffmpeg_path)
         if enc:
             return _encoder_cmd_args(enc, q) + ["-pix_fmt", "yuv420p", "-threads", "0"]
     crf = int(round(28 - q))
@@ -1078,7 +1119,8 @@ def _video_encoder_args(quality: int, use_gpu: bool, gpu_encoder: str) -> list[s
 def _export_ranges_with_ffmpeg_filters(
         video_path: str, output_path: str, ranges: list[tuple[int, int]],
         fps: float, quality: int, use_gpu: bool, gpu_encoder: str,
-        include_audio: bool, progress_cb=None) -> bool:
+        include_audio: bool, progress_cb=None,
+        ffmpeg_path: str | None = None) -> bool:
     """使用 FFmpeg trim/concat 快速导出左闭右开的帧区间。
 
     滤镜图通过 -filter_complex_script 写入文件（不走命令行），ffmpeg concat
@@ -1087,7 +1129,12 @@ def _export_ranges_with_ffmpeg_filters(
     if not ranges:
         return False
 
-    has_audio = include_audio and _has_audio_stream(video_path)
+    try:
+        ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
+    except FileNotFoundError:
+        return False
+
+    has_audio = include_audio and _has_audio_stream(video_path, ffmpeg_path=ffmpeg)
     with tempfile.TemporaryDirectory() as tmpdir:
         filter_file = os.path.join(tmpdir, "filter.txt")
         lines = []
@@ -1116,13 +1163,13 @@ def _export_ranges_with_ffmpeg_filters(
             handle.write(";\n".join(lines))
 
         cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
             "-i", video_path, "-filter_complex_script", filter_file,
             "-map", "[outv]",
         ]
         if has_audio:
             cmd += ["-map", "[outa]"]
-        cmd += _video_encoder_args(quality, use_gpu, gpu_encoder)
+        cmd += _video_encoder_args(quality, use_gpu, gpu_encoder, ffmpeg_path=ffmpeg)
         cmd += ["-c:a", "aac"] if has_audio else ["-an"]
         cmd.append(output_path)
 
@@ -1153,11 +1200,12 @@ def _export_ranges_with_ffmpeg_filters(
 
 def _mux_audio_for_ranges(video_path: str, video_only_path: str,
                           output_path: str, ranges: list[tuple[int, int]],
-                          fps: float):
-    if not _has_audio_stream(video_path):
+                          fps: float, ffmpeg_path: str | None = None):
+    if not _has_audio_stream(video_path, ffmpeg_path=ffmpeg_path):
         os.replace(video_only_path, output_path)
         return
 
+    ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
     with tempfile.TemporaryDirectory() as tmpdir:
         filter_file = os.path.join(tmpdir, "audio-filter.txt")
         lines = []
@@ -1173,7 +1221,7 @@ def _mux_audio_for_ranges(video_path: str, video_only_path: str,
 
         try:
             subprocess.run(
-                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
                  "-i", video_path, "-i", video_only_path,
                  "-filter_complex_script", filter_file,
                  "-map", "1:v:0", "-map", "[outa]",
@@ -1198,7 +1246,8 @@ def _mux_audio_for_ranges(video_path: str, video_only_path: str,
 
 def export_video(video_path: str, output_path: str, to_del,
                  fps: float, quality: int, progress_cb=None,
-                 use_gpu: bool = False, gpu_encoder: str = ""):
+                 use_gpu: bool = False, gpu_encoder: str = "",
+                 ffmpeg_path: str | None = None):
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -1215,9 +1264,14 @@ def export_video(video_path: str, output_path: str, to_del,
         cap.release()
         raise RuntimeError("没有可导出的帧")
 
-    if shutil.which("ffmpeg") and _export_ranges_with_ffmpeg_filters(
+    try:
+        ffmpeg_bin = resolve_ffmpeg_path(ffmpeg_path)
+    except FileNotFoundError:
+        ffmpeg_bin = None
+
+    if ffmpeg_bin and _export_ranges_with_ffmpeg_filters(
             video_path, output_path, ranges, fps, quality,
-            use_gpu, gpu_encoder, True, progress_cb):
+            use_gpu, gpu_encoder, True, progress_cb, ffmpeg_path=ffmpeg_bin):
         cap.release()
         return written_fast, total
 
@@ -1228,7 +1282,7 @@ def export_video(video_path: str, output_path: str, to_del,
         raise RuntimeError("无法读取视频帧")
     h, w = sample.shape[:2]
 
-    use_ffmpeg = bool(shutil.which("ffmpeg"))
+    use_ffmpeg = bool(ffmpeg_bin)
     video_only_path = output_path + ".video-only.tmp.mp4" if use_ffmpeg else output_path
     writer_kind = None
     ffmpeg_proc = None
@@ -1237,7 +1291,7 @@ def export_video(video_path: str, output_path: str, to_del,
     if use_ffmpeg:
         ffmpeg_proc = _open_ffmpeg_pipe_writer(
             video_only_path, fps, w, h, quality,
-            use_gpu=use_gpu, gpu_encoder=gpu_encoder)
+            use_gpu=use_gpu, gpu_encoder=gpu_encoder, ffmpeg_path=ffmpeg_bin)
         writer_kind = "ffmpeg"
     else:
         try:
@@ -1301,7 +1355,9 @@ def export_video(video_path: str, output_path: str, to_del,
 
     if use_ffmpeg:
         try:
-            _mux_audio_for_ranges(video_path, video_only_path, output_path, ranges, fps)
+            _mux_audio_for_ranges(
+                video_path, video_only_path, output_path, ranges, fps,
+                ffmpeg_path=ffmpeg_bin)
         finally:
             # 混流结束（无论成功失败）都要回收 video-only 临时文件。
             if video_only_path != output_path and os.path.isfile(video_only_path):
@@ -1314,15 +1370,20 @@ def export_video(video_path: str, output_path: str, to_del,
 
 def export_ranges(video_path: str, output_path: str, ranges: list,
                   fps: float, quality: int, progress_cb=None,
-                  use_gpu: bool = False, gpu_encoder: str = ""):
+                  use_gpu: bool = False, gpu_encoder: str = "",
+                  ffmpeg_path: str | None = None):
     if not ranges:
         return 0, 0
 
     exclusive_ranges = [(start, end + 1) for start, end in ranges]
     total_frames_to_export = sum(end - start for start, end in exclusive_ranges)
-    if shutil.which("ffmpeg") and _export_ranges_with_ffmpeg_filters(
+    try:
+        ffmpeg_bin = resolve_ffmpeg_path(ffmpeg_path)
+    except FileNotFoundError:
+        ffmpeg_bin = None
+    if ffmpeg_bin and _export_ranges_with_ffmpeg_filters(
             video_path, output_path, exclusive_ranges, fps, quality,
-            use_gpu, gpu_encoder, False, progress_cb):
+            use_gpu, gpu_encoder, False, progress_cb, ffmpeg_path=ffmpeg_bin):
         return total_frames_to_export, total_frames_to_export
 
     cap = cv2.VideoCapture(video_path)
@@ -1337,10 +1398,10 @@ def export_ranges(video_path: str, output_path: str, ranges: list,
     writer_kind = None
     ffmpeg_proc = None
     writer = None
-    if shutil.which("ffmpeg"):
+    if ffmpeg_bin:
         ffmpeg_proc = _open_ffmpeg_pipe_writer(
             output_path, fps, w, h, quality,
-            use_gpu=use_gpu, gpu_encoder=gpu_encoder)
+            use_gpu=use_gpu, gpu_encoder=gpu_encoder, ffmpeg_path=ffmpeg_bin)
         writer_kind = "ffmpeg"
     else:
         try:
@@ -1384,17 +1445,18 @@ def export_ranges(video_path: str, output_path: str, ranges: list,
 
 
 def _open_ffmpeg_pipe_writer(output_path: str, fps: float, w: int, h: int, quality: int, use_gpu: bool,
-                             gpu_encoder: str = ""):
+                             gpu_encoder: str = "", ffmpeg_path: str | None = None):
     q = max(0, min(10, int(quality)))
     crf = int(round(28 - q))
+    ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
     base_cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
         "-s", f"{w}x{h}", "-r", f"{fps}", "-i", "-", "-an",
     ]
 
     if use_gpu:
-        enc = _resolve_gpu_encoder(gpu_encoder)
+        enc = _resolve_gpu_encoder(gpu_encoder, ffmpeg_path=ffmpeg)
         if enc:
             cmd = base_cmd + _encoder_cmd_args(enc, q) + ["-pix_fmt", "yuv420p", output_path]
             return _spawn_ffmpeg_pipe(cmd)

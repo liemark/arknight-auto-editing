@@ -687,7 +687,8 @@ class VideoPreviewPlayer(tk.Frame):
                 written, total = analyzer.export_video(
                     self.video_path, p['output'], to_del, self.fps, p['quality'], prog,
                     use_gpu=p.get('export_use_gpu', False),
-                    gpu_encoder=p.get('gpu_encoder', ''))
+                    gpu_encoder=p.get('gpu_encoder', ''),
+                    ffmpeg_path=p.get('ffmpeg_path'))
                 self.after(0, lambda: self.settings.export_status_var.set(f"完成！{written}/{total} 帧"))
                 self.after(0,
                            lambda: messagebox.showinfo(
@@ -817,7 +818,8 @@ class VideoPreviewPlayer(tk.Frame):
                         self.video_path, final_path, seg['ranges'],
                         self.fps, p['quality'],
                         use_gpu=p.get('export_use_gpu', False),
-                        gpu_encoder=p.get('gpu_encoder', ''))
+                        gpu_encoder=p.get('gpu_encoder', ''),
+                        ffmpeg_path=p.get('ffmpeg_path'))
                     success = written > 0 and os.path.isfile(final_path) and os.path.getsize(final_path) > 0
                     if not success:
                         error_text = "未生成有效输出文件"

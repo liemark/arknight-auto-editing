@@ -345,11 +345,20 @@ class SettingsPanel(ttk.LabelFrame):
         def worker():
             try:
                 import analyzer
-                listed = analyzer.list_ffmpeg_gpu_encoders()
-                working = [enc for enc in listed if analyzer._gpu_encoder_works(enc)]
+                # 与分析/导出一致：PATH → imageio_ffmpeg → 设置里的路径
+                ffmpeg_raw = (self.ffmpeg_path_var.get() or "auto").strip()
+                ffmpeg_path = None if ffmpeg_raw.lower() in ("", "auto") else ffmpeg_raw
+                listed = analyzer.list_ffmpeg_gpu_encoders(ffmpeg_path)
+                working = [
+                    enc for enc in listed
+                    if analyzer._gpu_encoder_works(enc, ffmpeg_path=ffmpeg_path)
+                ]
                 result_queue.put((listed, working, ""))
-            except Exception:
-                result_queue.put(([], [], "未找到FFmpeg，请确认已安装并添加到PATH"))
+            except Exception as exc:
+                result_queue.put(
+                    ([], [], f"未找到可用 FFmpeg（{type(exc).__name__}: {exc}）；"
+                             f"可在「基本」页填写 FFmpeg 路径或安装 imageio-ffmpeg")
+                )
 
         def poll_result():
             try:
