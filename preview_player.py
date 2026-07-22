@@ -554,15 +554,17 @@ class VideoPreviewPlayer(tk.Frame):
                     ffmpeg_path=ffmpeg_path,
                 )
             except Exception as exc:
+                # Bind message now: lambda runs later; bare `exc` is cleared after except.
+                err_msg = (
+                    f"解码后端 {backend_label} 失败:\n"
+                    f"{type(exc).__name__}: {exc}\n\n"
+                    f"可改回 OpenCV（默认）后重试。"
+                )
                 self.after(
                     0,
-                    lambda: (
+                    lambda msg=err_msg: (
                         self.btn_analyze.config(state=tk.NORMAL, text="自动模板分析"),
-                        messagebox.showerror(
-                            "分析失败",
-                            f"解码后端 {backend_label} 失败:\n{type(exc).__name__}: {exc}\n\n"
-                            f"可改回 OpenCV（默认）后重试。",
-                        ),
+                        messagebox.showerror("分析失败", msg),
                     ),
                 )
                 return
