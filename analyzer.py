@@ -10,6 +10,7 @@ import multiprocessing
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 from frame_types import (FRAME_TYPE_NORMAL, FRAME_TYPE_PAUSE,
@@ -145,18 +146,302 @@ def _worker_classify_gray(gray: np.ndarray) -> int:
 
 
 # ---------------------------------------------------------------
-#  批量分析整段视频
+#  First-pass pause-boundary context (skip second VideoCapture scan)
 # ---------------------------------------------------------------
 
-def analyze_video(video_path: str, configs: dict, thresholds: dict,
-                  proc_res: tuple, batch_size: int, n_threads: int,
-                  progress_cb=None) -> tuple[np.ndarray, np.ndarray]:
+ANALYSIS_CONTEXT_VERSION = 1
+
+
+class _BoundaryTracker:
+    """Collect one scalar boundary record per pause run during ordered commit.
+
+    Keeps at most two small gray frames: prev_gray (also used for diffs) and
+    the open pause run's before-gray. Never grows with video duration.
+
+    Logical length is always the *decoded* frame count L, not container
+    metadata M. finish_with_last(decoded=L) must be used for EOF.
+    """
+
+    def __init__(self):
+        self.records: list[dict] = []
+        self._open_start: int | None = None
+        self._before_gray: np.ndarray | None = None
+        self._skipped_records = 0
+
+    def observe(
+        self,
+        idx: int,
+        gray: np.ndarray,
+        state: int,
+        prev_gray: np.ndarray | None,
+    ) -> None:
+        is_pause = int(state) == FRAME_TYPE_PAUSE
+        if self._open_start is None:
+            if is_pause:
+                self._open_start = idx
+                # before = max(0, start-1): previous gray, or this frame if start==0
+                src = gray if idx == 0 else prev_gray
+                self._before_gray = None if src is None else np.ascontiguousarray(src).copy()
+        elif not is_pause:
+            self._close_run(end=idx - 1, after_idx=idx, after_gray=gray)
+
+    def finish_with_last(self, decoded: int, last_gray: np.ndarray | None) -> None:
+        """Close a run still open at end-of-stream using logical length L=decoded."""
+        if self._open_start is None:
+            return
+        if decoded <= 0:
+            self._open_start = None
+            self._before_gray = None
+            self._skipped_records += 1
+            return
+        end = int(decoded) - 1
+        # Logical total L = decoded. Same formula as build_segments:
+        # after_idx = min(L - 1, end + 1). When pause reaches last frame,
+        # after_idx == end and we close with last_gray.
+        after_idx = min(int(decoded) - 1, end + 1)
+        if after_idx <= end:
+            if last_gray is not None:
+                self._close_run(end=end, after_idx=after_idx, after_gray=last_gray)
+                return
+        # Missing after frame → context incomplete
+        self._open_start = None
+        self._before_gray = None
+        self._skipped_records += 1
+
+    def _close_run(self, end: int, after_idx: int, after_gray: np.ndarray) -> None:
+        start = int(self._open_start)
+        before_idx = max(0, start - 1)
+        if self._before_gray is None:
+            self._open_start = None
+            self._before_gray = None
+            self._skipped_records += 1
+            return
+        diff = float(cv2.mean(cv2.absdiff(self._before_gray, after_gray))[0])
+        self.records.append(
+            {
+                "start": start,
+                "end": int(end),
+                "before_index": int(before_idx),
+                "after_index": int(after_idx),
+                "diff": diff,
+            }
+        )
+        self._open_start = None
+        self._before_gray = None
+
+    @property
+    def skipped(self) -> int:
+        return self._skipped_records
+
+
+def _make_analysis_context(
+    logical_len: int, records: list[dict], complete: bool
+) -> dict:
+    """logical_len L = len(states) after trim (= decoded). Not container metadata."""
+    L = int(logical_len)
+    return {
+        "version": ANALYSIS_CONTEXT_VERSION,
+        "complete": bool(complete),
+        "frame_count": L,
+        "decoded_frame_count": L,
+        "pause_boundary_diffs": list(records),
+    }
+
+
+def context_records_for_pauses(analysis_context, pauses: list, total: int):
+    """Return records if the whole context is usable; else None.
+
+    All-or-nothing: never mix cached and rescanned boundaries.
+    `total` must be len(states) (logical length L).
+    """
+    if not isinstance(analysis_context, dict):
+        return None
+    try:
+        if analysis_context.get("version") != ANALYSIS_CONTEXT_VERSION:
+            return None
+        if analysis_context.get("complete") is not True:
+            return None
+        L = int(total)
+        if int(analysis_context.get("frame_count", -1)) != L:
+            return None
+        if int(analysis_context.get("decoded_frame_count", -1)) != L:
+            return None
+        records = analysis_context.get("pause_boundary_diffs")
+        if not isinstance(records, list) or len(records) != len(pauses):
+            return None
+        for rec, p in zip(records, pauses):
+            if not isinstance(rec, dict):
+                return None
+            start, end = int(rec["start"]), int(rec["end"])
+            before, after = int(rec["before_index"]), int(rec["after_index"])
+            diff = float(rec["diff"])
+            if start != int(p["start"]) or end != int(p["end"]):
+                return None
+            if before != max(0, start - 1) or after != min(L - 1, end + 1):
+                return None
+            if not np.isfinite(diff):
+                return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    return records
+
+
+def analysis_context_skips_second_scan(analysis_context, pauses: list, total: int) -> bool:
+    """True when build_segments would skip the second VideoCapture scan."""
+    if not pauses:
+        return True
+    return context_records_for_pauses(analysis_context, pauses, total) is not None
+
+
+def _finalize_analysis_arrays(
+    states: np.ndarray,
+    diffs: np.ndarray,
+    allocated_total: int,
+    decoded: int,
+    tracker: _BoundaryTracker | None,
+    last_gray: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Trim to decoded length L; complete does NOT require L == metadata M."""
+    if decoded < len(states):
+        states = states[:decoded]
+        diffs = diffs[:decoded]
+    L = int(decoded)
+    if allocated_total > 0 and L < int(allocated_total):
+        print(
+            f"[analyze] logical length L={L} < container metadata M={int(allocated_total)} "
+            f"(using L for context completeness)",
+            flush=True,
+        )
+    if tracker is not None:
+        # Finish against logical length L, not container metadata.
+        tracker.finish_with_last(L, last_gray)
+        complete = tracker.skipped == 0 and L > 0
+        context = _make_analysis_context(L, tracker.records, complete)
+    else:
+        context = _make_analysis_context(L, [], False)
+    return states, diffs, context
+
+
+# ---------------------------------------------------------------
+#  分析解码后端（生产可选 A_PT）
+# ---------------------------------------------------------------
+
+# Default remains OpenCV for compatibility. Optional:
+#   ffmpeg_sw_passthrough == verified A_PT path
+#   (software decode + scale=area + gray + -fps_mode passthrough)
+DECODE_BACKEND_OPENCV = "opencv"
+DECODE_BACKEND_FFMPEG_SW_PASSTHROUGH = "ffmpeg_sw_passthrough"
+_DECODE_BACKEND_ALIASES = {
+    "opencv": DECODE_BACKEND_OPENCV,
+    "cv2": DECODE_BACKEND_OPENCV,
+    "default": DECODE_BACKEND_OPENCV,
+    "ffmpeg_sw_passthrough": DECODE_BACKEND_FFMPEG_SW_PASSTHROUGH,
+    "ffmpeg_sw_gray_passthrough": DECODE_BACKEND_FFMPEG_SW_PASSTHROUGH,
+    "a_pt": DECODE_BACKEND_FFMPEG_SW_PASSTHROUGH,
+}
+
+
+def normalize_decode_backend(decode_backend: str | None) -> str:
+    key = (decode_backend or DECODE_BACKEND_OPENCV).strip().lower()
+    if key not in _DECODE_BACKEND_ALIASES:
+        raise ValueError(
+            f"unknown decode_backend={decode_backend!r}; "
+            f"allowed={sorted(set(_DECODE_BACKEND_ALIASES.values()))}"
+        )
+    return _DECODE_BACKEND_ALIASES[key]
+
+
+def resolve_ffmpeg_path(ffmpeg_path: str | None = None) -> str:
+    """Resolve FFmpeg binary: explicit path → PATH → imageio_ffmpeg (if installed)."""
+    if ffmpeg_path:
+        p = os.path.expanduser(str(ffmpeg_path).strip())
+        if p and os.path.isfile(p):
+            return os.path.abspath(p)
+        found = shutil.which(p) if p else None
+        if found:
+            return found
+        raise FileNotFoundError(f"FFmpeg not found: {ffmpeg_path}")
+
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.isfile(exe):
+            return exe
+    except Exception:
+        pass
+
+    raise FileNotFoundError(
+        "FFmpeg not found on PATH and imageio_ffmpeg is unavailable; "
+        "set an explicit ffmpeg path in settings."
+    )
+
+
+def _read_exact(stream, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _ffmpeg_sw_passthrough_cmd(
+    ffmpeg: str, video_path: str, frames: int, proc_res: tuple[int, int]
+) -> list[str]:
+    """Verified A_PT command graph (do not add extra timestamp/sync flags)."""
+    pw, ph = int(proc_res[0]), int(proc_res[1])
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        video_path,
+        "-an",
+        "-frames:v",
+        str(int(frames)),
+        "-vf",
+        f"scale={pw}:{ph}:flags=area,format=gray",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-fps_mode",
+        "passthrough",
+        "pipe:1",
+    ]
+
+
+def _analyze_video_opencv(
+    video_path: str,
+    configs: dict,
+    thresholds: dict,
+    proc_res: tuple,
+    batch_size: int,
+    n_threads: int,
+    progress_cb=None,
+    want_context: bool = False,
+) -> tuple[np.ndarray, np.ndarray, dict | None]:
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    states = np.zeros(total, dtype=np.int8)
-    diffs = np.zeros(total, dtype=np.float32)
+    states = np.zeros(max(0, total), dtype=np.int8)
+    diffs = np.zeros(max(0, total), dtype=np.float32)
     n_workers = min(n_threads, multiprocessing.cpu_count())
     pw, ph = proc_res
+    tracker = _BoundaryTracker() if want_context else None
+    # If total unknown/0, still allow reading until EOF with growable lists.
+    use_dynamic = total <= 0
+    if use_dynamic:
+        states_list: list[int] = []
+        diffs_list: list[float] = []
+        tracker = _BoundaryTracker() if want_context else None
 
     with concurrent.futures.ProcessPoolExecutor(
             max_workers=n_workers,
@@ -165,22 +450,38 @@ def analyze_video(video_path: str, configs: dict, thresholds: dict,
 
         idx = 0
         prev_gray = None
+        last_gray = None
+        allocated_total = total
 
         while True:
             batch_grays = []
             batch_indices = []
+            batch_prev = []
 
             for _ in range(batch_size):
                 ret, frame = cap.read()
-                if not ret: break
+                if not ret:
+                    break
 
-                gray = cv2.cvtColor(cv2.resize(frame, (pw, ph), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+                gray = cv2.cvtColor(
+                    cv2.resize(frame, (pw, ph), interpolation=cv2.INTER_AREA),
+                    cv2.COLOR_BGR2GRAY,
+                )
                 batch_grays.append(gray)
                 batch_indices.append(idx)
+                batch_prev.append(prev_gray)
 
-                if prev_gray is not None:
-                    diffs[idx] = float(cv2.mean(cv2.absdiff(gray, prev_gray))[0])
+                if not use_dynamic:
+                    if prev_gray is not None and idx < len(diffs):
+                        diffs[idx] = float(cv2.mean(cv2.absdiff(gray, prev_gray))[0])
+                else:
+                    diffs_list.append(
+                        0.0
+                        if prev_gray is None
+                        else float(cv2.mean(cv2.absdiff(gray, prev_gray))[0])
+                    )
                 prev_gray = gray
+                last_gray = gray
                 idx += 1
 
             if not batch_grays:
@@ -189,14 +490,286 @@ def analyze_video(video_path: str, configs: dict, thresholds: dict,
             chunk = max(4, len(batch_grays) // (n_workers * 2))
             results = list(ex.map(_worker_classify_gray, batch_grays, chunksize=chunk))
 
-            for i, s in zip(batch_indices, results):
-                states[i] = s
+            for i, s, g, pg in zip(batch_indices, results, batch_grays, batch_prev):
+                if use_dynamic:
+                    states_list.append(int(s))
+                else:
+                    states[i] = s
+                if tracker is not None:
+                    tracker.observe(i, g, int(s), pg)
 
             if progress_cb:
-                progress_cb((idx / total) * 0.5)
+                denom = max(1, allocated_total if allocated_total > 0 else idx)
+                progress_cb((idx / denom) * 0.5)
 
     cap.release()
+    if use_dynamic:
+        states = np.asarray(states_list, dtype=np.int8)
+        diffs = np.asarray(diffs_list, dtype=np.float32)
+        allocated_total = idx
+        decoded = idx
+    else:
+        decoded = idx
+        # allocated_total from metadata; decoded may be smaller
+    if want_context:
+        states, diffs, context = _finalize_analysis_arrays(
+            states, diffs, max(allocated_total, decoded), decoded, tracker, last_gray
+        )
+        return states, diffs, context
+    if decoded < len(states):
+        states = states[:decoded]
+        diffs = diffs[:decoded]
+    return states, diffs, None
+
+
+def _analyze_video_ffmpeg_sw_passthrough(
+    video_path: str,
+    configs: dict,
+    thresholds: dict,
+    proc_res: tuple,
+    batch_size: int,
+    n_threads: int,
+    progress_cb=None,
+    ffmpeg_path: str | None = None,
+    want_context: bool = False,
+) -> tuple[np.ndarray, np.ndarray, dict | None]:
+    """Production A_PT: FFmpeg software gray@proc_res with output fps_mode=passthrough."""
+    ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
+    pw, ph = int(proc_res[0]), int(proc_res[1])
+    if pw <= 0 or ph <= 0:
+        raise ValueError(f"invalid proc_res={proc_res}")
+
+    # Frame count oracle matches existing OpenCV path (same CAP_PROP_FRAME_COUNT).
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cap.release()
+    if total <= 0:
+        raise RuntimeError(f"cannot determine frame count for {video_path}")
+
+    bpf = pw * ph
+    cmd = _ffmpeg_sw_passthrough_cmd(ffmpeg, video_path, total, (pw, ph))
+    # Wall budget scales with length; 180s is only enough for short clips.
+    timeout_s = max(180.0, 120.0 + float(total) * 0.12)
+
+    states = np.zeros(total, dtype=np.int8)
+    diffs = np.zeros(total, dtype=np.float32)
+    n_workers = min(n_threads, multiprocessing.cpu_count())
+    tracker = _BoundaryTracker() if want_context else None
+
+    stderr_file = tempfile.TemporaryFile()
+    proc: subprocess.Popen | None = None
+    got = 0
+    prev_gray = None
+    last_gray = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            creationflags=_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        if proc.stdout is None:
+            raise RuntimeError("FFmpeg stdout pipe unavailable")
+
+        deadline = time.perf_counter() + timeout_s
+
+        def _stderr_tail() -> str:
+            try:
+                stderr_file.flush()
+                stderr_file.seek(0, os.SEEK_END)
+                size = stderr_file.tell()
+                stderr_file.seek(max(0, size - 4096), os.SEEK_SET)
+                return stderr_file.read().decode("utf-8", errors="replace")
+            except Exception:
+                return ""
+
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_worker_init,
+            initargs=(configs, thresholds, proc_res),
+        ) as ex:
+            while got < total:
+                if time.perf_counter() > deadline:
+                    raise TimeoutError(
+                        f"FFmpeg A_PT timed out after {timeout_s:.1f}s at frame {got}/{total}"
+                    )
+
+                batch_n = min(int(batch_size), total - got)
+                batch_grays = []
+                batch_indices = []
+                batch_prev = []
+                eof = False
+                for _ in range(batch_n):
+                    raw = _read_exact(proc.stdout, bpf)
+                    if len(raw) == 0:
+                        # Clean EOF: CAP_PROP_FRAME_COUNT is often slightly high.
+                        eof = True
+                        break
+                    if len(raw) != bpf:
+                        raise RuntimeError(
+                            f"FFmpeg A_PT partial frame at index {got}/{total}; "
+                            f"got_bytes={len(raw)} expected={bpf}; "
+                            f"stderr={_stderr_tail()[:500]}"
+                        )
+                    gray = np.frombuffer(raw, dtype=np.uint8).reshape((ph, pw)).copy()
+                    batch_grays.append(gray)
+                    batch_indices.append(got)
+                    batch_prev.append(prev_gray)
+                    if prev_gray is not None:
+                        diffs[got] = float(cv2.mean(cv2.absdiff(gray, prev_gray))[0])
+                    prev_gray = gray
+                    last_gray = gray
+                    got += 1
+
+                if batch_grays:
+                    chunk = max(4, len(batch_grays) // (n_workers * 2))
+                    results = list(
+                        ex.map(_worker_classify_gray, batch_grays, chunksize=chunk)
+                    )
+                    for i, s, g, pg in zip(
+                        batch_indices, results, batch_grays, batch_prev
+                    ):
+                        states[i] = s
+                        if tracker is not None:
+                            tracker.observe(i, g, int(s), pg)
+                    if progress_cb:
+                        progress_cb((got / total) * 0.5)
+
+                if eof:
+                    break
+
+        # Drain/wait FFmpeg
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            rc = proc.wait(timeout=max(30.0, min(120.0, timeout_s * 0.1)))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise TimeoutError("FFmpeg A_PT did not exit after stdout closed")
+        if got == 0:
+            raise RuntimeError(
+                f"FFmpeg A_PT produced 0 frames; exit={rc}; stderr={_stderr_tail()[:500]}"
+            )
+        if got < total:
+            # Metadata overstated frame count (common). Accept actual stream length.
+            print(
+                f"[analyze] A_PT decoded {got}/{total} frames "
+                f"(container metadata may overstate FRAME_COUNT); exit={rc}",
+                flush=True,
+            )
+        elif rc not in (0, None) and got != total:
+            raise RuntimeError(
+                f"FFmpeg A_PT exit={rc} after {got}/{total} frames; stderr={_stderr_tail()[:500]}"
+            )
+    finally:
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10)
+            except Exception:
+                pass
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
+        try:
+            stderr_file.close()
+        except Exception:
+            pass
+
+    if want_context:
+        states, diffs, context = _finalize_analysis_arrays(
+            states, diffs, total, got, tracker, last_gray
+        )
+        return states, diffs, context
+    if got != total:
+        states = states[:got]
+        diffs = diffs[:got]
+    return states, diffs, None
+
+
+# ---------------------------------------------------------------
+#  批量分析整段视频
+# ---------------------------------------------------------------
+
+def analyze_video(video_path: str, configs: dict, thresholds: dict,
+                  proc_res: tuple, batch_size: int, n_threads: int,
+                  progress_cb=None,
+                  decode_backend: str = DECODE_BACKEND_OPENCV,
+                  ffmpeg_path: str | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Analyze full video into states/diffs (compatible two-item API).
+
+    decode_backend:
+      - "opencv" (default): production baseline BGR→INTER_AREA→GRAY
+      - "ffmpeg_sw_passthrough" / "a_pt": verified A_PT software gray path
+
+    For skipping the second boundary VideoCapture scan, prefer
+    analyze_video_with_context(...) and pass the context to build_segments.
+    """
+    states, diffs, _ = analyze_video_with_context(
+        video_path,
+        configs,
+        thresholds,
+        proc_res,
+        batch_size,
+        n_threads,
+        progress_cb,
+        decode_backend=decode_backend,
+        ffmpeg_path=ffmpeg_path,
+    )
     return states, diffs
+
+
+def analyze_video_with_context(
+    video_path: str,
+    configs: dict,
+    thresholds: dict,
+    proc_res: tuple,
+    batch_size: int,
+    n_threads: int,
+    progress_cb=None,
+    decode_backend: str = DECODE_BACKEND_OPENCV,
+    ffmpeg_path: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Three-item API: (states, diffs, analysis_context).
+
+    analysis_context is JSON-safe (no frame pixels). When complete, pass it to
+    build_segments(..., analysis_context=context) to skip the second boundary
+    VideoCapture scan. Incomplete/mismatched context is rejected wholesale.
+    """
+    backend = normalize_decode_backend(decode_backend)
+    if backend == DECODE_BACKEND_OPENCV:
+        states, diffs, context = _analyze_video_opencv(
+            video_path,
+            configs,
+            thresholds,
+            proc_res,
+            batch_size,
+            n_threads,
+            progress_cb,
+            want_context=True,
+        )
+        return states, diffs, context or _make_analysis_context(len(states), [], False)
+    if backend == DECODE_BACKEND_FFMPEG_SW_PASSTHROUGH:
+        states, diffs, context = _analyze_video_ffmpeg_sw_passthrough(
+            video_path,
+            configs,
+            thresholds,
+            proc_res,
+            batch_size,
+            n_threads,
+            progress_cb,
+            ffmpeg_path=ffmpeg_path,
+            want_context=True,
+        )
+        return states, diffs, context or _make_analysis_context(len(states), [], False)
+    raise ValueError(f"unsupported decode_backend={backend!r}")
 
 
 # ---------------------------------------------------------------
@@ -256,7 +829,8 @@ def _analyze_pause_mask(s_i: int, e_i: int, diffs: np.ndarray, still_frames: int
 
 
 def build_segments(states: np.ndarray, diffs: np.ndarray, video_path: str, proc_res: tuple,
-                   compare_cfg: dict, fps: float, progress_cb=None) -> tuple[list, list]:
+                   compare_cfg: dict, fps: float, progress_cb=None, *,
+                   analysis_context=None) -> tuple[list, list]:
     total = len(states)
     pauses = []
     speeds = []
@@ -285,12 +859,30 @@ def build_segments(states: np.ndarray, diffs: np.ndarray, video_path: str, proc_
                 'local_del_mask': del_mask,
                 'boundary_diff': 0.0  # 预占位，稍后计算
             })
-            if progress_cb: progress_cb(0.5 + (e_i / total) * 0.25)
+            if progress_cb: progress_cb(0.5 + (e_i / max(1, total)) * 0.25)
 
         elif curr in (FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X):
             speeds.append({'type': curr, 'start': s_i, 'end': e_i})
 
-    # 2. 批量极速比对暂停边界差异
+    # 2. 暂停边界差分
+    #    完整的第一遍 analysis_context 可直接提供每个暂停段的 boundary_diff，
+    #    此时不再打开第二个 VideoCapture。上下文不可用时整体拒绝并回退到
+    #    原始全量顺序 grab 扫描；绝不混用缓存与重扫结果。
+    context_records = None
+    if pauses and analysis_context is not None:
+        context_records = context_records_for_pauses(analysis_context, pauses, total)
+
+    if pauses and context_records is not None:
+        for p, rec in zip(pauses, context_records):
+            diff = float(rec['diff'])
+            p['boundary_diff'] = diff
+            # 严格小于：等于阈值不强制全删
+            if diff < boundary_thresh:
+                p['mode'] = 'all'
+        if progress_cb:
+            progress_cb(1.0)
+        return pauses, speeds
+
     if pauses:
         cap = cv2.VideoCapture(video_path)
         # 获取所有目标帧索引，去重并排序
@@ -320,6 +912,8 @@ def build_segments(states: np.ndarray, diffs: np.ndarray, video_path: str, proc_
                 # 核心机制：一旦前后差距过小，不管之前算出来动作多大，一律强制“全删”
                 if diff < boundary_thresh:
                     p['mode'] = 'all'
+        if progress_cb:
+            progress_cb(1.0)
 
     return pauses, speeds
 
@@ -403,7 +997,7 @@ def _kept_frame_ranges(to_del: np.ndarray) -> list[tuple[int, int]]:
     return ranges
 
 
-def _has_audio_stream(video_path: str) -> bool:
+def _has_audio_stream(video_path: str, ffmpeg_path: str | None = None) -> bool:
     ffprobe = shutil.which("ffprobe")
     if ffprobe:
         try:
@@ -416,8 +1010,9 @@ def _has_audio_stream(video_path: str) -> bool:
         except Exception:
             pass
 
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
+    try:
+        ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
+    except FileNotFoundError:
         return False
     try:
         result = subprocess.run(
@@ -442,43 +1037,51 @@ def _gpu_encoder_probe_args(enc: str) -> list[str]:
     return ["-c:v", enc]
 
 
-def _gpu_encoder_works(enc: str, timeout: float = 5) -> bool:
+def _gpu_encoder_works(enc: str, timeout: float = 5, ffmpeg_path: str | None = None) -> bool:
     # 单飞探测：探测全程持锁，避免多线程并发启动多个 ffmpeg 探测同一编码器，
     # 进而在 GPU 资源紧张时因并发抢占产生假阴性。
     with _GPU_PROBE_LOCK:
-        cached = _GPU_PROBE_CACHE.get(enc)
+        cache_key = f"{enc}|{ffmpeg_path or ''}"
+        cached = _GPU_PROBE_CACHE.get(cache_key)
         if cached is not None:
             return cached
 
         try:
+            ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
+        except FileNotFoundError:
+            _GPU_PROBE_CACHE[cache_key] = False
+            return False
+
+        try:
             subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                [ffmpeg, "-hide_banner", "-loglevel", "error",
                  "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=0.1",
                  *_gpu_encoder_probe_args(enc), "-f", "null", "-"],
                 check=True, capture_output=True, timeout=timeout,
                 creationflags=_NO_WINDOW)
         except FileNotFoundError:
             # FFmpeg 不在 PATH：确定不可用，缓存 False。
-            _GPU_PROBE_CACHE[enc] = False
+            _GPU_PROBE_CACHE[cache_key] = False
             return False
         except subprocess.CalledProcessError:
             # 编码器确实初始化失败（ffmpeg 正常退出且给出错误）：缓存 False。
             # 但超时（TimeoutExpired）等瞬时失败不在此分支，不缓存。
-            _GPU_PROBE_CACHE[enc] = False
+            _GPU_PROBE_CACHE[cache_key] = False
             return False
         except Exception:
             # 瞬时失败（超时、GPU 被占用、驱动初始化等）：不缓存，下次重新探测，
             # 避免一次偶发失败永久禁用该编码器。
             return False
 
-        _GPU_PROBE_CACHE[enc] = True
+        _GPU_PROBE_CACHE[cache_key] = True
         return True
 
 
-def list_ffmpeg_gpu_encoders() -> list[str]:
+def list_ffmpeg_gpu_encoders(ffmpeg_path: str | None = None) -> list[str]:
     try:
+        ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
         output = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-encoders"],
+            [ffmpeg, "-hide_banner", "-encoders"],
             text=True, stderr=subprocess.STDOUT, timeout=10,
             creationflags=_NO_WINDOW)
     except Exception:
@@ -491,20 +1094,26 @@ def list_ffmpeg_gpu_encoders() -> list[str]:
     return [enc for enc in candidates if enc in output]
 
 
-def list_working_gpu_encoders() -> list[str]:
-    return [enc for enc in list_ffmpeg_gpu_encoders() if _gpu_encoder_works(enc)]
+def list_working_gpu_encoders(ffmpeg_path: str | None = None) -> list[str]:
+    return [
+        enc
+        for enc in list_ffmpeg_gpu_encoders(ffmpeg_path)
+        if _gpu_encoder_works(enc, ffmpeg_path=ffmpeg_path)
+    ]
 
 
-def _pick_gpu_encoder() -> str | None:
-    working = list_working_gpu_encoders()
+def _pick_gpu_encoder(ffmpeg_path: str | None = None) -> str | None:
+    working = list_working_gpu_encoders(ffmpeg_path)
     return working[0] if working else None
 
 
-def _resolve_gpu_encoder(gpu_encoder: str | None) -> str | None:
+def _resolve_gpu_encoder(
+    gpu_encoder: str | None, ffmpeg_path: str | None = None
+) -> str | None:
     selected = (gpu_encoder or "").strip()
     if selected:
-        return selected if _gpu_encoder_works(selected) else None
-    return _pick_gpu_encoder()
+        return selected if _gpu_encoder_works(selected, ffmpeg_path=ffmpeg_path) else None
+    return _pick_gpu_encoder(ffmpeg_path)
 
 
 def _encoder_cmd_args(enc: str, quality: int) -> list[str]:
@@ -520,10 +1129,15 @@ def _encoder_cmd_args(enc: str, quality: int) -> list[str]:
     return ["-c:v", enc, "-q:v", qp]
 
 
-def _video_encoder_args(quality: int, use_gpu: bool, gpu_encoder: str) -> list[str]:
+def _video_encoder_args(
+    quality: int,
+    use_gpu: bool,
+    gpu_encoder: str,
+    ffmpeg_path: str | None = None,
+) -> list[str]:
     q = max(0, min(10, int(quality)))
     if use_gpu:
-        enc = _resolve_gpu_encoder(gpu_encoder)
+        enc = _resolve_gpu_encoder(gpu_encoder, ffmpeg_path=ffmpeg_path)
         if enc:
             return _encoder_cmd_args(enc, q) + ["-pix_fmt", "yuv420p", "-threads", "0"]
     crf = int(round(28 - q))
@@ -534,7 +1148,8 @@ def _video_encoder_args(quality: int, use_gpu: bool, gpu_encoder: str) -> list[s
 def _export_ranges_with_ffmpeg_filters(
         video_path: str, output_path: str, ranges: list[tuple[int, int]],
         fps: float, quality: int, use_gpu: bool, gpu_encoder: str,
-        include_audio: bool, progress_cb=None) -> bool:
+        include_audio: bool, progress_cb=None,
+        ffmpeg_path: str | None = None) -> bool:
     """使用 FFmpeg trim/concat 快速导出左闭右开的帧区间。
 
     滤镜图通过 -filter_complex_script 写入文件（不走命令行），ffmpeg concat
@@ -543,7 +1158,12 @@ def _export_ranges_with_ffmpeg_filters(
     if not ranges:
         return False
 
-    has_audio = include_audio and _has_audio_stream(video_path)
+    try:
+        ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
+    except FileNotFoundError:
+        return False
+
+    has_audio = include_audio and _has_audio_stream(video_path, ffmpeg_path=ffmpeg)
     with tempfile.TemporaryDirectory() as tmpdir:
         filter_file = os.path.join(tmpdir, "filter.txt")
         lines = []
@@ -572,13 +1192,13 @@ def _export_ranges_with_ffmpeg_filters(
             handle.write(";\n".join(lines))
 
         cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
             "-i", video_path, "-filter_complex_script", filter_file,
             "-map", "[outv]",
         ]
         if has_audio:
             cmd += ["-map", "[outa]"]
-        cmd += _video_encoder_args(quality, use_gpu, gpu_encoder)
+        cmd += _video_encoder_args(quality, use_gpu, gpu_encoder, ffmpeg_path=ffmpeg)
         cmd += ["-c:a", "aac"] if has_audio else ["-an"]
         cmd.append(output_path)
 
@@ -609,11 +1229,12 @@ def _export_ranges_with_ffmpeg_filters(
 
 def _mux_audio_for_ranges(video_path: str, video_only_path: str,
                           output_path: str, ranges: list[tuple[int, int]],
-                          fps: float):
-    if not _has_audio_stream(video_path):
+                          fps: float, ffmpeg_path: str | None = None):
+    if not _has_audio_stream(video_path, ffmpeg_path=ffmpeg_path):
         os.replace(video_only_path, output_path)
         return
 
+    ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
     with tempfile.TemporaryDirectory() as tmpdir:
         filter_file = os.path.join(tmpdir, "audio-filter.txt")
         lines = []
@@ -629,7 +1250,7 @@ def _mux_audio_for_ranges(video_path: str, video_only_path: str,
 
         try:
             subprocess.run(
-                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
                  "-i", video_path, "-i", video_only_path,
                  "-filter_complex_script", filter_file,
                  "-map", "1:v:0", "-map", "[outa]",
@@ -654,7 +1275,8 @@ def _mux_audio_for_ranges(video_path: str, video_only_path: str,
 
 def export_video(video_path: str, output_path: str, to_del,
                  fps: float, quality: int, progress_cb=None,
-                 use_gpu: bool = False, gpu_encoder: str = ""):
+                 use_gpu: bool = False, gpu_encoder: str = "",
+                 ffmpeg_path: str | None = None):
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -671,9 +1293,14 @@ def export_video(video_path: str, output_path: str, to_del,
         cap.release()
         raise RuntimeError("没有可导出的帧")
 
-    if shutil.which("ffmpeg") and _export_ranges_with_ffmpeg_filters(
+    try:
+        ffmpeg_bin = resolve_ffmpeg_path(ffmpeg_path)
+    except FileNotFoundError:
+        ffmpeg_bin = None
+
+    if ffmpeg_bin and _export_ranges_with_ffmpeg_filters(
             video_path, output_path, ranges, fps, quality,
-            use_gpu, gpu_encoder, True, progress_cb):
+            use_gpu, gpu_encoder, True, progress_cb, ffmpeg_path=ffmpeg_bin):
         cap.release()
         return written_fast, total
 
@@ -684,7 +1311,7 @@ def export_video(video_path: str, output_path: str, to_del,
         raise RuntimeError("无法读取视频帧")
     h, w = sample.shape[:2]
 
-    use_ffmpeg = bool(shutil.which("ffmpeg"))
+    use_ffmpeg = bool(ffmpeg_bin)
     video_only_path = output_path + ".video-only.tmp.mp4" if use_ffmpeg else output_path
     writer_kind = None
     ffmpeg_proc = None
@@ -693,7 +1320,7 @@ def export_video(video_path: str, output_path: str, to_del,
     if use_ffmpeg:
         ffmpeg_proc = _open_ffmpeg_pipe_writer(
             video_only_path, fps, w, h, quality,
-            use_gpu=use_gpu, gpu_encoder=gpu_encoder)
+            use_gpu=use_gpu, gpu_encoder=gpu_encoder, ffmpeg_path=ffmpeg_bin)
         writer_kind = "ffmpeg"
     else:
         try:
@@ -757,7 +1384,9 @@ def export_video(video_path: str, output_path: str, to_del,
 
     if use_ffmpeg:
         try:
-            _mux_audio_for_ranges(video_path, video_only_path, output_path, ranges, fps)
+            _mux_audio_for_ranges(
+                video_path, video_only_path, output_path, ranges, fps,
+                ffmpeg_path=ffmpeg_bin)
         finally:
             # 混流结束（无论成功失败）都要回收 video-only 临时文件。
             if video_only_path != output_path and os.path.isfile(video_only_path):
@@ -770,15 +1399,20 @@ def export_video(video_path: str, output_path: str, to_del,
 
 def export_ranges(video_path: str, output_path: str, ranges: list,
                   fps: float, quality: int, progress_cb=None,
-                  use_gpu: bool = False, gpu_encoder: str = ""):
+                  use_gpu: bool = False, gpu_encoder: str = "",
+                  ffmpeg_path: str | None = None):
     if not ranges:
         return 0, 0
 
     exclusive_ranges = [(start, end + 1) for start, end in ranges]
     total_frames_to_export = sum(end - start for start, end in exclusive_ranges)
-    if shutil.which("ffmpeg") and _export_ranges_with_ffmpeg_filters(
+    try:
+        ffmpeg_bin = resolve_ffmpeg_path(ffmpeg_path)
+    except FileNotFoundError:
+        ffmpeg_bin = None
+    if ffmpeg_bin and _export_ranges_with_ffmpeg_filters(
             video_path, output_path, exclusive_ranges, fps, quality,
-            use_gpu, gpu_encoder, False, progress_cb):
+            use_gpu, gpu_encoder, False, progress_cb, ffmpeg_path=ffmpeg_bin):
         return total_frames_to_export, total_frames_to_export
 
     cap = cv2.VideoCapture(video_path)
@@ -793,10 +1427,10 @@ def export_ranges(video_path: str, output_path: str, ranges: list,
     writer_kind = None
     ffmpeg_proc = None
     writer = None
-    if shutil.which("ffmpeg"):
+    if ffmpeg_bin:
         ffmpeg_proc = _open_ffmpeg_pipe_writer(
             output_path, fps, w, h, quality,
-            use_gpu=use_gpu, gpu_encoder=gpu_encoder)
+            use_gpu=use_gpu, gpu_encoder=gpu_encoder, ffmpeg_path=ffmpeg_bin)
         writer_kind = "ffmpeg"
     else:
         try:
@@ -840,17 +1474,18 @@ def export_ranges(video_path: str, output_path: str, ranges: list,
 
 
 def _open_ffmpeg_pipe_writer(output_path: str, fps: float, w: int, h: int, quality: int, use_gpu: bool,
-                             gpu_encoder: str = ""):
+                             gpu_encoder: str = "", ffmpeg_path: str | None = None):
     q = max(0, min(10, int(quality)))
     crf = int(round(28 - q))
+    ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
     base_cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
         "-s", f"{w}x{h}", "-r", f"{fps}", "-i", "-", "-an",
     ]
 
     if use_gpu:
-        enc = _resolve_gpu_encoder(gpu_encoder)
+        enc = _resolve_gpu_encoder(gpu_encoder, ffmpeg_path=ffmpeg)
         if enc:
             cmd = base_cmd + _encoder_cmd_args(enc, q) + ["-pix_fmt", "yuv420p", output_path]
             return _spawn_ffmpeg_pipe(cmd)
