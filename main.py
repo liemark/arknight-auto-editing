@@ -3,10 +3,124 @@
 import tkinter as tk
 from tkinter import ttk, filedialog
 import os
+import sys
 import multiprocessing   # ProcessPoolExecutor 需要在入口处 freeze_support
 
 from settings_panel import SettingsPanel
 from preview_player import VideoPreviewPlayer
+
+
+def _run_check() -> int:
+    """无界面自检：打包后的 exe 用它验证依赖/模板/ffmpeg 是否都带全了。
+
+    windowed exe 没有控制台，所以结果写进程序目录的 check-report.txt 并以退出码表示成败。
+    """
+    import traceback
+    lines = []
+    ok = True
+
+    def add(name, good, detail=""):
+        nonlocal ok
+        ok = ok and bool(good)
+        lines.append(f"[{'PASS' if good else 'FAIL'}] {name}" + (f"  {detail}" if detail else ""))
+
+    add("Python", True, sys.version.split()[0])
+    # frozen 只作信息：源码运行时为 False 属于正常，不算失败
+    lines.append(f"[INFO] frozen={bool(getattr(sys, 'frozen', False))} "
+                 f"meipass={getattr(sys, '_MEIPASS', '')}")
+
+    try:
+        import numpy
+        add("numpy", True, numpy.__version__)
+    except Exception as exc:
+        add("numpy", False, repr(exc))
+    try:
+        import cv2
+        add("cv2", True, f"{cv2.__version__} opencl={cv2.ocl.haveOpenCL()}")
+    except Exception as exc:
+        add("cv2", False, repr(exc))
+    try:
+        import PIL.ImageTk  # noqa: F401
+        add("Pillow/ImageTk", True)
+    except Exception as exc:
+        add("Pillow/ImageTk", False, repr(exc))
+    try:
+        import imageio  # noqa: F401
+        add("imageio", True)
+    except Exception as exc:
+        add("imageio", False, repr(exc))
+
+    try:
+        import analyzer
+        configs, loaded = analyzer.load_templates((400, 225))
+        per = {k: len(v) for k, v in configs.items()}
+        add("模板加载", loaded > 0, f"共 {loaded} 个 {per}")
+    except Exception as exc:
+        add("模板加载", False, repr(exc))
+
+    try:
+        import gpu_caps
+        path = gpu_caps.resolve_ffmpeg_path()
+        info = gpu_caps.ffmpeg_info(path)
+        add("ffmpeg", True, f"{path} | hwaccels={','.join(info.get('hwaccels') or [])}")
+        working = gpu_caps.list_working_gpu_encoders(path)
+        add("硬件编码器实测", True, ", ".join(working) or "无（将用 libx264）")
+    except Exception as exc:
+        add("ffmpeg", False, f"{type(exc).__name__}: {exc}")
+
+    try:
+        import gpu_caps
+        add("CUDA 匹配加速", True, gpu_caps.pack_status_text())
+    except Exception as exc:
+        add("CUDA 匹配加速", False, repr(exc))
+
+    try:
+        import matcher
+        add("匹配后端可用性", True, ", ".join(matcher.available_backends()))
+    except Exception as exc:
+        add("匹配后端可用性", False, repr(exc))
+
+    # 可选：给一段视频就真的跑一次完整分析（打包后的端到端验收）
+    video = None
+    if "--video" in sys.argv:
+        i = sys.argv.index("--video")
+        if i + 1 < len(sys.argv):
+            video = sys.argv[i + 1]
+    if video and os.path.isfile(video):
+        try:
+            import time as _time
+            import analyzer
+            configs, _loaded = analyzer.load_templates((400, 225))
+            thr = {"pause": 0.7, "speed_1x": 0.7, "speed_2x": 0.7, "speed_0_2x": 0.7}
+            stats = {}
+            t0 = _time.perf_counter()
+            states, diffs, ctx = analyzer.analyze_video_with_context(
+                video, configs, thr, (400, 225), 128, 8,
+                decode_backend="auto", match_backend="auto",
+                skip_identical=True, on_stats=stats.update)
+            dt = _time.perf_counter() - t0
+            uniq = {int(k): int(v) for k, v in zip(*__import__("numpy").unique(states, return_counts=True))}
+            add("端到端分析", len(states) > 0,
+                f"{len(states)} 帧 / {dt:.2f}s / {dt / max(1, len(states)) * 1000:.3f} ms/帧 / "
+                f"解码={stats.get('decode_backend')} 匹配={stats.get('match_backend')} / "
+                f"状态分布={uniq} / context完整={ctx.get('complete')}")
+        except Exception as exc:
+            add("端到端分析", False, f"{type(exc).__name__}: {exc}")
+    elif video:
+        add("端到端分析", False, f"视频不存在: {video}")
+
+    add("multiprocessing.freeze_support", True)
+
+    report = os.path.join(os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
+                                                          else __file__)), "check-report.txt")
+    try:
+        with open(report, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + f"\n\n结果: {'全部通过' if ok else '有失败项'}\n")
+    except OSError:
+        pass
+    for line in lines:
+        print(line, flush=True)
+    return 0 if ok else 1
 
 
 def main():
@@ -70,4 +184,6 @@ if __name__ == "__main__":
     # Windows 下用 PyInstaller/cx_Freeze 打包时必须调用，
     # 否则 ProcessPoolExecutor 会递归启动子进程崩溃
     multiprocessing.freeze_support()
+    if "--check" in sys.argv:
+        raise SystemExit(_run_check())
     main()

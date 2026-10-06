@@ -1,5 +1,7 @@
 .venv
-.kilo
+.hf_cache
+.vscode
+.uvcache
 __pycache__
 build
 dist
