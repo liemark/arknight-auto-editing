@@ -1,0 +1,16 @@
+_base_: base.yaml
+# 数据构建专用配置: python -m audio_inverse.build_data --config configs/data_atoms.yaml
+
+build:
+  rebuild_manifest: false      # true = 忽略已有 manifest.json 重新扫描
+  rebuild_atomlib: false       # true = 重新打包 wav.i16
+  verify_wav_headers: true     # 用 WAV 头实测 sr/ch 覆盖 JSON 里的值
+  review_groups: true          # 打印划分后的组样例, 便于人工确认无近邻泄漏
+
+atomlib_dir: audio_inverse/data/atomlib
+
+# 原子库统计的展示开关
+report:
+  show_sr_hist: true
+  show_kind_hist: true
+  show_voice_hi8k: true        # 统计语音原子 8kHz 以上能量占比 (确认 16k 上限)

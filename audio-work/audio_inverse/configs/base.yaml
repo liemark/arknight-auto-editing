@@ -1,0 +1,134 @@
+# 全局基础配置。其他 configs/*.yaml 用 `_base_: base.yaml` 继承并覆盖。
+# 路径一律相对仓库根 (audio_inverse 包的上一级)。
+
+seed: 1337
+
+# ---------------------------------------------------------------- 数据位置
+# atom_root 的真实位置是 audio_inverse/data/atoms (已按 sfx/voice/assets 合并);
+# _audio_lab 现在是指向它的目录 junction, 保留旧路径以兼容历史脚本与配置。
+# 【路径基准】所有相对路径都相对 REPO_ROOT = audio_inverse/ 的上一级 = audio-work/ 解析
+# (见 config.py:19-21: PKG_ROOT=audio_inverse/audio_inverse, REPO_ROOT=audio-work)。
+# ⚠️ 这里曾经写 `_audio_lab`，它会被解析成 `audio-work/_audio_lab` —— 那个目录**不存在**
+# (真正的 junction 在仓库根 `arknight-auto-editing/_audio_lab`)。后果是静默的：
+# prepare_rehearsal 的 _collect_noise 扫不到任何 MUSAN 文件 -> 180 条背景里 72 条
+# 变成常数 1e-6 的**直流**，训练里约 40% 的"背景"是一个 DC 偏置而不是噪声。
+# 所以这里一律写【相对 audio-work 的真实路径】。
+data_root: audio_inverse/data            # manifest / atomlib / rehearsal / ckpt 的根
+atom_root: audio_inverse/data/atoms      # 解包音频根 (只读复用, 不复制)
+real_root: audio_inverse/data/atoms/real # 真实录音; 训练背景 / 域差探针用
+
+# 顺序 = atom id 顺序, 不要重排 (见 manifest.py 的 DEFAULT_INDEXES 注释)。
+atom_indexes:                            # 清单来源 (相对 atom_root)
+  - sfx/index_root.json
+  - sfx/index_player.json
+  - sfx/index_custom_se.json
+  - sfx/index_enemy.json
+  - voice/index_voice_battle_jp.json
+  - voice/index_voice_battle_cn.json
+
+# 语音可换更高采样率音源: 指向 44.1k 原始语音包目录后, voice 原子将从这里取,
+# 未命中则回退到 atom_indexes 里的 16k 版本。留空 = 用现有 16k (8kHz 以上不可反相)。
+voice_src_root: ""
+
+# 划分比例。默认按【原子】哈希划分 (97/1.5/1.5):
+# 按 group 划分虽然能做到 train∩test=0, 但实测测试原子到训练集的最近邻余弦中位
+# 0.992 (全库高度重复, 防泄漏目的没达到), 代价是 21% 原子从未进训练。
+# 按原子划分覆盖 97%, 测试集仍有价值 (同组不同原子, 最近邻不是它自己)。
+split_ratios: [0.97, 0.015, 0.015]
+split_by: atom                          # atom | group (group = 测"泛化到新音效")
+split_salt: ai-v1
+
+# ---------------------------------------------------------------- 音频常数
+sr: 48000
+n_fft: 2048
+hop: 960                                 # 50 Hz 谱帧
+n_mels: 128
+mel_fmin: 20.0
+mel_fmax: 24000.0
+frame_rate: 25                           # 编码器输出帧率 (conv stride 2 后)
+
+# ---------------------------------------------------------------- 运行
+device: cuda
+num_workers: 4
+# 混合精度: bfloat16 (推荐, Ada/Ampere 原生支持, 无需 GradScaler) | float16 (需 GradScaler) | none
+amp_dtype: bfloat16
+compile: false
+log_dir: audio_inverse/data/logs
+out_dir: audio_inverse/out
+
+# ---------------------------------------------------------------- 模型
+model:
+  d_model: 384
+  conv_layers: 1          # 10s@48k, hop 960 -> 500 谱帧 @50Hz -> 250 帧 @ 25Hz
+  n_layers: 8
+  n_heads: 6
+  ff: 1536
+  dropout: 0.1
+  grad_ckpt: true
+  n_cand: 64              # 每位置检索的候选数
+  d_re: 256
+  re_layers: 4
+  re_heads: 8
+  n_pos_bins: 8           # 帧内亚帧偏移的离散 bin 数
+
+# ---------------------------------------------------------------- 训练
+train:
+  max_steps: 300000
+  batch_size: 8
+  accum: 4                # 等效 batch 32
+  lr: 1.0e-4
+  lr_front: 5.0e-5
+  wd: 0.01
+  warmup: 2000
+  clip: 1.0
+  log_every: 20
+  val_every: 1000
+  val_batches: 8
+  epoch_size: 2048        # 每个"epoch"的样本数 (决定 shuffle 粒度)
+  n_samples: 1000000      # 数据集逻辑长度 (流式生成, 不占磁盘)
+  val_samples: 2048
+  # rec (波形重建) 的规模: 仅在线合成路径生效 (见文件末尾说明)
+  rec_len: 4096           # 每个实例参与重建的采样数 (48k 下约 85ms)
+  rec_max: 4              # 每样本最多重建几个实例 (控制显存与耗时)
+  rec_use_pred: true      # true=用模型预测参数 (有梯度, 是训练信号)
+
+# ---------------------------------------------------------------- 合成 / 混音
+# ⚠️ atom_target_rms_db 必须是【整条链唯一的一个值】。
+# 混音器用它把每个原子归一化到该电平，而 render_events / cancel / ideal_cancel
+# 一侧写的是 -34.0（models/synthesize.py:69、detector/cancel.py:59,123）。
+# 之前 base.yaml 没有 synth: 段，make_mixer 用了自己的默认 -26.0 ->
+# 合成样本与"真值反相轨"之间有 8 dB 的幅度口径差，正好制造 README §8 警告的
+# "任何一处不一致都会让相消变成增强"。这里显式钉成 -34.0（= 文档常量）。
+synth:
+  atom_target_rms_db: -34.0
+  max_instances: 64
+  short_atom_dur: 0.6
+  safety_ceiling: 0.98
+  n_bands: 16
+
+# ---------------------------------------------------------------- 评估
+eval:
+  n_windows: 500          # 每个难度档的测试窗口数
+  levels: [D0, D1, D2, D3, D4]
+  test_hard: true
+  out_report: audio_inverse/data/eval_report.md
+
+# ---------------------------------------------------------------- 损失权重
+loss:
+  ev: 1.0                 # 事件存在性 (帧级 BCE)
+  pos: 0.5                # 帧内亚帧偏移 (bin 分类 + 期望偏移回归)
+  presence: 1.0           # top-K 候选里哪一列是对的 (BCE, 仅命中位置)
+  id: 1.0                 # top-K 内的排序 (CE, 仅命中位置)
+  par: 1.0                # 物理参数 Huber 回归 (23 维)
+  par_top1: 0.3           # top-1 路径权重, 防参数头梯度死锁
+  rec: 0.0                # 波形重建: 默认关 (开启前提见下)
+
+# rec: (波形重建) 的开关与规模。
+# 【开启前提】时延误差中位要进到几百采样以内, 否则重建波形与原音频完全错位,
+# 残差恒等于原信号能量 -> 梯度是纯噪声, 只会干扰其他分项。README §6 有数据。
+# 【生效范围】rec 依赖 pack 里的 delays 字段, 只有【在线合成】(base.yaml) 有;
+# 池模式 (pool.yaml) 的 pack 为省内存没存 delays, 开了也会被静默跳过。
+# 注意: 相关键属于上面那个 train: 段, 不要在这里再写一个 train: —— YAML 里
+# 重复的顶层键会让后者【整个覆盖】前者 (max_steps/lr/warmup 会全部丢失)。
+
+

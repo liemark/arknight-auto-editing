@@ -1,0 +1,20 @@
+{
+ "n": 22328,
+ "n_samples": 1514970378,
+ "bytes": 3029940756,
+ "total_dur": 65117.41,
+ "built": 1789546971.3647492,
+ "manifest_source": "F:\\杂七杂八\\arknight-auto-editing\\_audio_lab",
+ "stat_names": [
+  "rms_db",
+  "peak",
+  "active_ratio",
+  "centroid_hz",
+  "hi8k_ratio"
+ ],
+ "sr_hist": {
+  "16000": 14088,
+  "44100": 2383,
+  "48000": 5857
+ }
+}

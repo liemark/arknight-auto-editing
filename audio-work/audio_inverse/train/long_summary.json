@@ -1,0 +1,18 @@
+{
+ "sr": 44100,
+ "n": 16797,
+ "samples": 5624802237,
+ "total_min": 2125.78,
+ "kinds": {
+  "voice_battle": 14088,
+  "music": 940,
+  "ambience": 136,
+  "long_se": 1629,
+  "dialog": 4
+ },
+ "dur_p50": 3.111,
+ "dur_max": 120.0,
+ "cap": 120.0,
+ "bad": 0,
+ "index": "long44/index_long.json"
+}

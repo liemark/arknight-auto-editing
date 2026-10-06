@@ -1,0 +1,41 @@
+_base_: base.yaml
+# 推荐训练配置: 预生成样本池 + 单进程数据加载 (稳定优先)
+#
+# 为什么需要池: 在线合成在 CPU 上做失真链 (0.2~2.4 s/样本), DataLoader 只能喂
+# ~12 样本/s, 而 GPU 前向+反向只要几十毫秒 -> CUDA 利用率 < 1% (实测显存
+# 只用 3.1/8 GB, 核心基本空转)。池把重活离线做完, 训练时只做 memmap 读
+# (实测串行读 984 样本/s)。
+#
+# 步骤:
+#   1) 生成池 (一次性; 6 进程约 7 样本/s):
+#        python -m audio_inverse.synth.pool_builder --n 6000 --workers 6
+#        python -m audio_inverse.synth.pool_builder --n 600  --workers 6 --split val
+#   2) 训练:
+#        python -m audio_inverse.train --config pool.yaml
+#
+# 实测 (bs=16, 预池化 + 逐候选打分头):
+#   前反向 263 ms, 显存峰值 4.21 GB
+#   num_workers=0 (Windows 上 spawn 传池会 MemoryError, 已加自动回退但仍默认单进程)
+
+train:
+  pool_root: audio_inverse/data/pool     # 仓库根相对; 里面需有 train/ 与 val/
+  val_pool_subdir: val
+  epoch_size: 4096
+  max_steps: 30000
+
+  # bs=16 实测 4.2GB / 263ms 前反向 (8GB 卡安全区); bs=24 是 6.2GB
+  batch_size: 24
+  accum: 1
+  num_workers: 0   # 别改成 >0: Windows spawn 会把整个池 pickle 给子进程 -> MemoryError 卡死
+
+  lr: 1e-5
+  lr_front: 5e-5
+  ckpt_every: 500             # 每 500 步落一次 last.pt/定期快照 (中断最多丢 500 步)
+  val_every: 2000
+  val_batches: 8
+  log_every: 50
+
+progress:
+  enabled: true
+  export_acc_threshold: 0.80   # val_acc 到这个值后, 每次 best 更新都导出试听包
+  rec_iters: 4

@@ -1,0 +1,1 @@
+﻿把长音素材（环境音/剧情音/战斗语音）的 wav 放在这里，并用 ml/make_index.py 生成 index_long.json（见 docs/TRAINING.md 2.1/2.2）。
