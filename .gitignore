@@ -1,5 +1,5 @@
 .venv
-.kilo
+.uvcache
 __pycache__
 build
 dist
