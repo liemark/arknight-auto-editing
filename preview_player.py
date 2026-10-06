@@ -498,6 +498,127 @@ class VideoPreviewPlayer(tk.Frame):
                 break
 
     # ==========================================================
+<<<<<<< Updated upstream
+=======
+    #  性能：硬件探测 + 匹配后端测速
+    # ==========================================================
+    def _proc_res_for_video(self) -> tuple:
+        p = self.settings.get_params()
+        proc_res = list(p['proc_res'])
+        if not self.video_path:
+            return tuple(proc_res)
+        try:
+            cap_tmp = cv2.VideoCapture(self.video_path)
+            ret, f = cap_tmp.read()
+            cap_tmp.release()
+            if ret and proc_res[1] == 225:
+                h, ww = f.shape[:2]
+                proc_res[1] = int(proc_res[0] * h / ww)
+        except Exception:
+            pass
+        return tuple(proc_res)
+
+    def get_templates(self, proc_res: tuple):
+        cached = self._template_cache.get(proc_res)
+        if cached is None:
+            import analyzer
+            # load_templates 内部已剔除「区分不了类别」的模板并写日志
+            cached = analyzer.load_templates(proc_res)
+            self._template_cache[proc_res] = cached
+        return cached
+
+    def ensure_profile(self, force: bool = False):
+        import gpu_caps
+        try:
+            self.profile = gpu_caps.detect(
+                self.settings.get_params().get('ffmpeg_path'), force=force)
+        except Exception as exc:
+            app_core.error(f"硬件探测失败: {exc}", "preview")
+        return self.profile
+
+    def run_autotune(self, force: bool = False, on_done=None):
+        """实测各后端选最快的（结果写入缓存并被后续分析使用）。"""
+        if not self.video_path:
+            if on_done:
+                on_done("请先加载视频再测速")
+            return
+        if self._bench_running:
+            return
+        self._bench_running = True
+        p = self.settings.get_params()
+        proc_res = self._proc_res_for_video()
+        self.settings.set_bench_text("正在实测各匹配后端…")
+
+        def worker():
+            import matcher
+            try:
+                profile = self.ensure_profile()
+                configs, loaded = self.get_templates(proc_res)
+                if loaded == 0:
+                    msg = "未找到模板，无法测速"
+                    self.after(0, lambda: self.settings.set_bench_text(msg))
+                    return
+                sample = matcher.sample_gray_frames(
+                    self.video_path, proc_res, count=64,
+                    decode_backend=p.get('decode_backend', 'auto'),
+                    ffmpeg_path=p.get('ffmpeg_path'))
+                if len(sample) == 0:
+                    self.after(0, lambda: self.settings.set_bench_text("抽帧失败，无法测速"))
+                    return
+                compiled = matcher.compile_templates(
+                    configs, proc_res, frame_wh=(sample.shape[2], sample.shape[1]))
+                key = matcher.bench_cache_key(compiled, profile, proc_res)
+                cached = None if force else matcher.cached_choice(key)
+                if cached and cached.get('chosen'):
+                    chosen = cached['chosen']
+                    text = (f"（缓存）已选 {matcher.backend_label(chosen)} · " + " ".join(
+                        f"{matcher.backend_label(r['backend'])} {r['ms_per_frame']:.3f}"
+                        for r in cached.get('results', []) if r.get('ok')))
+                else:
+                    results, chosen = matcher.autotune(
+                        compiled, configs, p['thresholds'], proc_res, sample,
+                        profile=profile)
+                    matcher.store_choice(key, chosen or matcher.BACKEND_CV2_DIRECT, results)
+                    text = matcher.format_results(results, chosen)
+                self.match_backend = chosen
+
+                def apply():
+                    self.settings.set_bench_text(text)
+                    self._update_perf_label()
+                    if on_done:
+                        on_done(text)
+                self.after(0, apply)
+            except Exception as exc:
+                msg = f"测速失败：{type(exc).__name__}: {exc}"
+                app_core.error(msg, "preview")
+                self.after(0, lambda m=msg: self.settings.set_bench_text(m))
+            finally:
+                self._bench_running = False
+
+        threading.Thread(target=worker, daemon=True, name="autotune").start()
+
+    def _update_perf_label(self, stats: dict | None = None):
+        import pipeline
+        import matcher
+        if stats:
+            self._last_stats = stats
+        st = self._last_stats
+        if not st:
+            txt = "性能：尚未分析"
+            if self.match_backend:
+                txt += f" · 匹配将用 {matcher.backend_label(self.match_backend)}"
+            self.lbl_perf.config(text=txt)
+            return
+        dec = pipeline.decode_backend_label(st.get('decode_backend', '?'))
+        mb = matcher.backend_label(st.get('match_backend', '?'))
+        skip = st.get('skip_ratio', 0.0) * 100
+        self.lbl_perf.config(
+            text=(f"性能：{dec} + {mb} · 端到端 {st.get('ms_per_frame', 0):.3f} ms/帧 · "
+                  f"匹配 {st.get('match_ms_per_frame', 0):.3f} ms/帧 · "
+                  f"静止帧跳过 {skip:.0f}%"))
+
+    # ==========================================================
+>>>>>>> Stashed changes
     #  模板分析
     # ==========================================================
     def _start_analysis(self):
@@ -683,22 +804,63 @@ class VideoPreviewPlayer(tk.Frame):
                 self.total_frames, states, self.pause_segments, self.speed_segments,
                 self.clip_segments, p['speedup_1x'], p['speedup_02'], p['speedup_02_factor'])
 
+            # 把「要删多少帧」写进事件区：一眼能看出是分析没判出暂停，还是掩码没删
+            try:
+                n_del = int(np.count_nonzero(to_del))
+                n_all = sum(1 for s in self.pause_segments if s.get('mode') == 'all')
+                empty = sum(1 for s in self.pause_segments
+                            if not np.any(np.asarray(s.get('local_del_mask', []))))
+                app_core.info(
+                    f"导出前统计：删除 {n_del}/{self.total_frames} 帧 · "
+                    f"暂停段 {len(self.pause_segments)} 个（整段删 {n_all}，掩码全空 {empty}）· "
+                    f"剪辑段 {len(self.clip_segments)} 个", "export")
+            except Exception:
+                pass
+
             def prog(ratio, written):
                 self.after(0, lambda r=ratio: (
                     self.settings.export_progress_var.set(r * 100),
                     self.settings.export_status_var.set(f"写入 {int(r * 100)}%")))
+
+            def phase(text):
+                # 显示当前实际阶段，避免界面一直停在「准备导出…」
+                self.after(0, lambda t=text: self.settings.export_status_var.set(t))
 
             try:
                 written, total = analyzer.export_video(
                     self.video_path, p['output'], to_del, self.fps, p['quality'], prog,
                     use_gpu=p.get('export_use_gpu', False),
                     gpu_encoder=p.get('gpu_encoder', ''),
+<<<<<<< Updated upstream
                     ffmpeg_path=p.get('ffmpeg_path'))
                 self.after(0, lambda: self.settings.export_status_var.set(f"完成！{written}/{total} 帧"))
                 self.after(0,
                            lambda: messagebox.showinfo(
                                "导出完成",
                                f"输出：{p['output']}\n总帧：{total}，保留：{written}\n已保留原始音频（如有）"))
+=======
+                    ffmpeg_path=p.get('ffmpeg_path'),
+                    export_preset=p.get('export_preset') or None,
+                    export_workers=p.get('export_workers') or None,
+                    keyframe_copy=p.get('keyframe_copy', True),
+                    export_audio=p.get('export_audio', True),
+                    cancel_event=self._export_cancel,
+                    profile=profile,
+                    status_cb=phase)
+                enc = p.get('gpu_encoder', '') or '自动'
+                workers = p.get('export_workers') or '自动'
+                self.after(0, lambda: self.settings.export_status_var.set(
+                    f"完成！{written}/{total} 帧（编码器 {enc}）"))
+                self.after(0, lambda: messagebox.showinfo(
+                    "导出完成",
+                    f"输出：{p['output']}\n总帧：{total}，保留：{written}\n"
+                    f"编码器：{enc} · 并发 {workers}\n"
+                    f"（已保留原始音频；无损直通命中时不重编码视频）"))
+            except exporter.ExportCancelled:
+                self.after(0, lambda: self.settings.export_status_var.set("已取消"))
+                self.after(0, lambda: messagebox.showinfo(
+                    "已取消", "导出已取消，临时文件已清理。"))
+>>>>>>> Stashed changes
             except Exception as e:
                 self.after(0, lambda err=str(e): messagebox.showerror("导出失败", err))
             finally:
@@ -824,8 +986,18 @@ class VideoPreviewPlayer(tk.Frame):
                         self.fps, p['quality'],
                         use_gpu=p.get('export_use_gpu', False),
                         gpu_encoder=p.get('gpu_encoder', ''),
+<<<<<<< Updated upstream
                         ffmpeg_path=p.get('ffmpeg_path'))
                     success = written > 0 and os.path.isfile(final_path) and os.path.getsize(final_path) > 0
+=======
+                        ffmpeg_path=p.get('ffmpeg_path'),
+                        export_preset=p.get('export_preset') or None,
+                        keyframe_copy=p.get('keyframe_copy', True),
+                        export_audio=p.get('export_audio', True),
+                        cancel_event=self._seg_cancel)
+                    success = written > 0 and os.path.isfile(final_path) \
+                        and os.path.getsize(final_path) > 0
+>>>>>>> Stashed changes
                     if not success:
                         error_text = "未生成有效输出文件"
                 except Exception as e:

@@ -1,0 +1,20 @@
+[PASS] Python  3.13.7
+[INFO] frozen=False meipass=
+[PASS] numpy  2.5.1
+[PASS] cv2  5.0.0 opencl=True
+[PASS] Pillow/ImageTk
+[PASS] imageio
+[PASS] 模板加载  共 6 个 {'pause': 3, 'speed_1x': 1, 'speed_2x': 1, 'speed_0_2x': 1}
+[PASS] ffmpeg  C:\Users\liuco\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffmpeg.EXE | hwaccels=cuda,vaapi,dxva2,qsv,d3d11va,opencl,vulkan,d3d12va,amf
+[PASS] 硬件编码器实测  av1_nvenc, hevc_nvenc, h264_nvenc, hevc_qsv, h264_qsv
+[INFO] torch_dir=C:\Users\liuco\AppData\Local\arknight-auto-editing\gpu-torch has_torch=True
+[STEP] pack dir registered, importing torch ...
+[STEP] torch imported: 2.11.0+cu128 (C:\Users\liuco\AppData\Local\arknight-auto-editing\gpu-torch\torch\__init__.py)
+[STEP] cuda_available=True
+[STEP] device=NVIDIA GeForce RTX 4060 Laptop GPU
+[PASS] CUDA 匹配加速  已启用 torch 2.11.0+cu128 · CUDA 12.8 · NVIDIA GeForce RTX 4060 Laptop GPU（本地）
+[INFO] torch_status={'installed': True, 'version': '2.11.0+cu128', 'cuda_available': True, 'device_name': 'NVIDIA GeForce RTX 4060 Laptop GPU', 'cuda_version': '12.8', 'torch_dml': False, 'reason': '', 'device_count': 1, 'source': 'import'}
+[PASS] 匹配后端可用性  torch_cuda, opencl, cpu_batch, cv2_direct, cpu_pool
+[PASS] multiprocessing.freeze_support
+
+结果: 全部通过

@@ -197,6 +197,55 @@ class SettingsPanel(ttk.LabelFrame):
             row=r, column=1, sticky=tk.W, padx=4)
         r += 1
 
+<<<<<<< Updated upstream
+=======
+        # ---- 编码器设置（全部读实测结果） ----
+        ttk.Label(tab_export, text="编码器:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        self.gpu_encoder_var = tk.StringVar()
+        self.gpu_encoder_combo = ttk.Combobox(
+            tab_export, textvariable=self.gpu_encoder_var, state="readonly", width=20)
+        self.gpu_encoder_combo.grid(row=r, column=1, columnspan=2, sticky=tk.W, padx=4)
+        self.gpu_encoder_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_presets())
+        r += 1
+
+        ttk.Label(tab_export, text="编码速度预设:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        self.export_preset_var = tk.StringVar()
+        self.export_preset_combo = ttk.Combobox(
+            tab_export, textvariable=self.export_preset_var, state="readonly", width=20)
+        self.export_preset_combo.grid(row=r, column=1, columnspan=2, sticky=tk.W, padx=4)
+        r += 1
+
+        ttk.Label(tab_export, text="导出并发数:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        self.export_workers_var = tk.IntVar(value=max(1, (os.cpu_count() or 2) // 2))
+        ttk.Spinbox(tab_export, from_=1, to=8, textvariable=self.export_workers_var,
+                    width=8).grid(row=r, column=1, sticky=tk.W, padx=4)
+        r += 1
+
+        self.gpu_encoder_hint = tk.StringVar(value="正在实际测试编码器…")
+        tk.Label(tab_export, textvariable=self.gpu_encoder_hint, foreground="#666666",
+                 justify=tk.LEFT, wraplength=320).grid(
+            row=r, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+        r += 1
+
+        self.export_use_gpu_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tab_export, text="启用 GPU 导出加速(FFmpeg)",
+                        variable=self.export_use_gpu_var).grid(
+            row=r, column=0, columnspan=3, sticky=tk.W, pady=(2, 2))
+        r += 1
+
+        self.keyframe_copy_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tab_export, text="极速无损模式（关键帧对齐时自动启用）",
+                        variable=self.keyframe_copy_var).grid(
+            row=r, column=0, columnspan=3, sticky=tk.W)
+        r += 1
+
+        self.no_audio_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tab_export, text="不导出音频（更快）",
+                        variable=self.no_audio_var).grid(
+            row=r, column=0, columnspan=3, sticky=tk.W)
+        r += 1
+
+>>>>>>> Stashed changes
         self.export_btn = ttk.Button(tab_export, text="导出整段剪辑视频", command=self._on_export)
         self.export_btn.grid(row=r, column=0, columnspan=3, pady=8)
         r += 1
@@ -404,6 +453,15 @@ class SettingsPanel(ttk.LabelFrame):
             'output': self.output_var.get(),
             'quality': self.quality_var.get(),
             'export_use_gpu': self.export_use_gpu_var.get(),
+<<<<<<< Updated upstream
             'gpu_encoder': self.gpu_encoder_var.get(),
+=======
+            'gpu_encoder': ("" if (self.gpu_encoder_var.get() or "").strip() == "自动"
+                            else self.gpu_encoder_var.get()),
+            'export_preset': (self.export_preset_var.get() or "").strip(),
+            'export_workers': self.export_workers_var.get(),
+            'keyframe_copy': self.keyframe_copy_var.get(),
+            'export_audio': not self.no_audio_var.get(),
+>>>>>>> Stashed changes
             'merge_pause_ops': self.merge_pause_ops_var.get(),
         }

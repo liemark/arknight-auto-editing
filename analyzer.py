@@ -46,7 +46,8 @@ TEMPLATE_DIRS = {
 IMG_EXTS = ('.png', '.jpg', '.bmp', '.jpeg')
 
 
-def load_templates(proc_res: tuple = (400, 225)) -> tuple[dict, int]:
+def load_templates(proc_res: tuple = (400, 225),
+                   drop_indistinct: bool = True) -> tuple[dict, int]:
     configs: dict[str, list] = {k: [] for k in TEMPLATE_DIRS}
     total = 0
 
@@ -62,6 +63,14 @@ def load_templates(proc_res: tuple = (400, 225)) -> tuple[dict, int]:
         if src_img is None: continue
         sh, sw = src_img.shape
 
+        # 整帧缩放后的源图：模板要从这里裁，才能和「分析时整帧缩放」的像素一致。
+        # 若改成「原图裁块再单独缩放」，插值与取整会和帧不同，模板自匹配分数
+        # 会掉到 0.7 上下，阈值就没有余量（实测 2x 模板 0.737、1x 0.862）。
+        scaled_src = None
+        if (sw, sh) != (int(proc_res[0]), int(proc_res[1])):
+            scaled_src = cv2.resize(src_img, (int(proc_res[0]), int(proc_res[1])),
+                                    interpolation=cv2.INTER_AREA)
+
         for rf in ref_files:
             ref_img = cv2.imread(os.path.join(ref_dir, rf), cv2.IMREAD_GRAYSCALE)
             if ref_img is None: continue
@@ -74,20 +83,142 @@ def load_templates(proc_res: tuple = (400, 225)) -> tuple[dict, int]:
 
             scale_x, scale_y = proc_res[0] / sw, proc_res[1] / sh
             ext = 2.0
-            erx = max(0, int(rx * scale_x - rw * scale_x * (ext - 1) / 2))
-            ery = max(0, int(ry * scale_y - rh * scale_y * (ext - 1) / 2))
-            tw, th = max(1, int(rw * scale_x)), max(1, int(rh * scale_y))
+            tw, th = max(1, int(round(rw * scale_x))), max(1, int(round(rh * scale_y)))
 
+            cached_t = None
+            if scaled_src is not None:
+                tx, ty = int(round(rx * scale_x)), int(round(ry * scale_y))
+                patch = scaled_src[ty:ty + th, tx:tx + tw]
+                if patch.shape == (th, tw):
+                    cached_t = patch.copy()
+            if cached_t is None:
+                cached_t = cv2.resize(ref_img, (tw, th), interpolation=cv2.INTER_AREA)
+
+            erx = max(0, int(rx * scale_x - tw * (ext - 1) / 2))
+            ery = max(0, int(ry * scale_y - th * (ext - 1) / 2))
             configs[ctype].append({
                 'roi_orig': (rx, ry, rw, rh),
                 'source_res': (sw, sh),
                 'cached_proc_res': proc_res,
-                'cached_roi': (erx, ery, int(rw * scale_x * ext), int(rh * scale_y * ext)),
-                'cached_t': cv2.resize(ref_img, (tw, th), interpolation=cv2.INTER_AREA),
+                'cached_roi': (erx, ery, int(tw * ext), int(th * ext)),
+                'cached_t': cached_t,
                 'cached_m': cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST),
             })
             total += 1
+
+    # 所有入口统一在这里剔除「区分不了类别」的模板（例如把常驻 UI 元素
+    # 当成 0.2 倍速标志），否则界面、自检、分析三条路的分类结果会不一致。
+    if drop_indistinct:
+        configs, notes = filter_indistinct_templates(configs, proc_res)
+        for note in notes:
+            app_core.warn(note, "matcher")
+        total = sum(len(v) for v in configs.values())
     return configs, total
+
+
+def _source_frames(proc_res: tuple) -> dict:
+    """每类取一张「整帧缩放后」的源图，返回 {类别: (内容指纹, 帧)}。
+
+    指纹用于识别重复素材：source_images_play 与 source_images_2x 可能放的
+    是同一张截图，不能拿它当另一类的负例（否则会把正确的模板误判成不可区分）。
+    """
+    import hashlib
+
+    out: dict = {}
+    for ctype, dirs in TEMPLATE_DIRS.items():
+        src_dir = asset_dir(dirs['source_dir'])
+        if not src_dir:
+            continue
+        files = [f for f in os.listdir(src_dir) if f.lower().endswith(IMG_EXTS)]
+        if not files:
+            continue
+        path = os.path.join(src_dir, files[0])
+        img = imread_gray(path)
+        if img is None:
+            continue
+        try:
+            with open(path, 'rb') as fh:
+                digest = hashlib.md5(fh.read()).hexdigest()
+        except OSError:
+            digest = os.path.normcase(path)
+        sh, sw = img.shape
+        if (sw, sh) != (int(proc_res[0]), int(proc_res[1])):
+            img = cv2.resize(img, (int(proc_res[0]), int(proc_res[1])),
+                             interpolation=cv2.INTER_AREA)
+        out[ctype] = (digest, img)
+    return out
+
+
+def template_discrimination(configs: dict, proc_res: tuple = (400, 225)) -> dict:
+    """每类模板的区分度：在自己源图上的分数 vs 在「别类且不同源图」上的最高分。
+
+    比值接近 1 说明这类模板在别的类别画面上也一样高分——它区分不了类别。
+    典型例子：把常驻 UI 元素（速度条上的暂停图标等）当成「0.2 倍速」标志，
+    结果任何播放中的画面都会被判成 0.2 倍速。
+    """
+    frames = _source_frames(proc_res)
+
+    out: dict = {}
+    for ctype, tpls in configs.items():
+        if not tpls or ctype not in frames:
+            continue
+        own_digest, own_frame = frames[ctype]
+        own = max(float(matcher.get_best_score(own_frame, [t], proc_res)) for t in tpls)
+        cross = 0.0
+        for other, (odigest, oframe) in frames.items():
+            if other == ctype or odigest == own_digest:
+                continue
+            for t in tpls:
+                cross = max(cross, float(matcher.get_best_score(oframe, [t], proc_res)))
+        out[ctype] = {'self': own, 'cross': cross,
+                      'ratio': (cross / own) if own > 1e-6 else 99.0}
+    return out
+
+
+def filter_indistinct_templates(configs: dict, proc_res: tuple = (400, 225),
+                                ratio_limit: float = 0.95) -> tuple[dict, list[str]]:
+    """剔除「区分不了类别」的模板（在别类源图上同样高分），返回 (configs, 说明)。"""
+    disc = template_discrimination(configs, proc_res)
+    notes: list[str] = []
+    kept = {k: list(v) for k, v in configs.items()}
+    for ctype, d in disc.items():
+        if d['ratio'] >= ratio_limit and d['self'] > 0:
+            kept[ctype] = []
+            notes.append(f"{ctype} 已停用：模板在别类画面上也能得 {d['cross']:.3f}"
+                         f"（自己 {d['self']:.3f}），无法区分，请换一张真正的标志图")
+    return kept, notes
+
+
+def template_self_scores(configs: dict, proc_res: tuple = (400, 225)) -> dict:
+    """每个模板在它自己的源截图上的匹配分数（理想接近 1）。
+
+    这是阈值是否留有余量的直接指标：自匹配只有 0.7x 时，真实视频上很容易
+    跌破阈值，从而漏判或串类（例如 2 倍速被判成 0.2 倍速）。
+    """
+    out: dict[str, float] = {}
+    for ctype, dirs in TEMPLATE_DIRS.items():
+        src_dir = asset_dir(dirs['source_dir'])
+        ref_dir = asset_dir(dirs['ref_dir'])
+        if not src_dir or not ref_dir:
+            continue
+        src_files = [f for f in os.listdir(src_dir) if f.lower().endswith(IMG_EXTS)]
+        if not src_files:
+            continue
+        src_img = imread_gray(os.path.join(src_dir, src_files[0]))
+        if src_img is None:
+            continue
+        sh, sw = src_img.shape
+        frame = src_img
+        if (sw, sh) != (int(proc_res[0]), int(proc_res[1])):
+            frame = cv2.resize(src_img, (int(proc_res[0]), int(proc_res[1])),
+                               interpolation=cv2.INTER_AREA)
+        best = -1.0
+        for t in configs.get(ctype, []):
+            score = matcher.get_best_score(frame, [t], proc_res)
+            best = max(best, float(score))
+        if best > -1.0:
+            out[ctype] = best
+    return out
 
 
 # ---------------------------------------------------------------
@@ -859,7 +990,8 @@ def build_segments(states: np.ndarray, diffs: np.ndarray, video_path: str, proc_
                 'local_del_mask': del_mask,
                 'boundary_diff': 0.0  # 预占位，稍后计算
             })
-            if progress_cb: progress_cb(0.5 + (e_i / max(1, total)) * 0.25)
+            if progress_cb:
+                progress_cb(0.5 + (e_i / max(1, total)) * 0.25)
 
         elif curr in (FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X):
             speeds.append({'type': curr, 'start': s_i, 'end': e_i})
@@ -955,12 +1087,13 @@ def build_delete_set(total: int, states: np.ndarray,
 
     for seg in pause_segments:
         s, e = seg['start'], seg['end']
-        mode = seg.get('mode', 'auto')
-        if mode == 'all':
+        m = seg.get('local_del_mask')
+        if seg.get('mode') == 'all' or m is None or len(m) != e - s + 1:
+            # 边界是渐变（boundary_diff 小）→ 整段删掉，这是最干脆的剪法
             del_mask[s:e + 1] = True
         elif mode == 'auto' and 'local_del_mask' in seg:
             m = seg['local_del_mask']
-            # 1 为自动删除，2 为人工强制删除
+            # 1 自动删除，2 人工强制删除
             del_mask[s:e + 1] = (m == 1) | (m == 2)
 
     for seg in clip_segments:
