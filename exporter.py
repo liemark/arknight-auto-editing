@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import bisect
 import concurrent.futures
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -28,8 +30,12 @@ import gpu_caps
 
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
-_CHUNK_MIN_SEGMENTS = 24
+# 单次 ffmpeg 滤镜图里最多放多少个区间：区间数一多，滤镜图初始化会变得极慢
+# 而且期间 ffmpeg 不输出 -progress，界面上看就是「卡住」
+_MAX_RANGES_PER_CHUNK = 200
+_MAX_GOP_FRAMES = 900          # 关键帧间隔上限（15s@60fps），超过就认为索引不可信
 _KEYFRAME_CACHE: dict[str, tuple[float, list[int]]] = {}
+_KEYFRAME_LOCKS: dict[str, threading.Lock] = {}
 _AUDIO_CACHE: dict[str, bool] = {}
 _CACHE_LOCK = threading.Lock()
 
@@ -165,9 +171,118 @@ def _duration_ok(path: str, expected_frames: int, fps: float,
     return True, ""
 
 
+def _count_tolerance(n_ranges: int) -> int:
+    """帧数校验容差。
+
+    区间多时也不能放宽到几十帧，否则「只出了 8 帧」这种截断成品会被当成
+    「存疑但正确」放行。
+    """
+    return max(2, min(16, n_ranges))
+
+
+def _mp4_keyframes(path: str) -> list[int] | None:
+    """从 MP4/MOV 容器的 stss 索引直接读关键帧帧号（0 基）。
+
+    只读 moov 里的小索引表，不开解码器、不扫全片，长片也是毫秒级；
+    ffprobe 的 -skip_frame nokey 需要读完整个文件的包，既慢又可能中途出错
+    只拿到前半段（实测 56 分钟素材只扫到前 17 分钟，导致靠后的分块拿不到
+    锚点、只能从第 0 帧开始解码）。读不到就返回 None，调用方回退 ffprobe。
+    """
+    if not path.lower().endswith(('.mp4', '.mov', '.m4v', '.m4a')):
+        return None
+    import struct
+    containers = {b'moov', b'trak', b'mdia', b'minf', b'stbl', b'edts', b'dinf',
+                  b'udta', b'meta', b'ilst'}
+
+    def find(fh, start: int, end: int, want: bytes, depth: int = 0) -> list:
+        out = []
+        fh.seek(start)
+        while fh.tell() + 8 <= end:
+            pos = fh.tell()
+            head = fh.read(8)
+            if len(head) < 8:
+                break
+            size, typ = struct.unpack('>I4s', head)
+            if size == 1:
+                size = struct.unpack('>Q', fh.read(8))[0]
+            if size == 0:
+                size = end - pos
+            if size < 8 or pos + size > end:
+                break
+            if typ == want:
+                out.append((pos, size))
+            if typ in containers and depth < 8:
+                inner = pos + (12 if typ == b'meta' else 8)
+                out.extend(find(fh, inner, pos + size, want, depth + 1))
+            fh.seek(pos + size)
+        return out
+
+    try:
+        with open(path, 'rb') as fh:
+            total = os.fstat(fh.fileno()).st_size
+            moovs = find(fh, 0, total, b'moov')
+            for moov_at, moov_size in moovs:
+                for trak_at, trak_size in find(fh, moov_at + 8, moov_at + moov_size,
+                                               b'trak'):
+                    hdlrs = find(fh, trak_at + 8, trak_at + trak_size, b'hdlr')
+                    is_video = False
+                    for hp, _hs in hdlrs:
+                        fh.seek(hp + 16)
+                        if fh.read(4) == b'vide':
+                            is_video = True
+                            break
+                    if not is_video:
+                        continue
+                    stss = find(fh, trak_at + 8, trak_at + trak_size, b'stss')
+                    if not stss:
+                        continue
+                    fh.seek(stss[0][0] + 12)          # box: size+type+version/flags+count
+                    data = fh.read(4)
+                    if len(data) < 4:
+                        continue
+                    count = struct.unpack('>I', data)[0]
+                    if count <= 0 or count > 5_000_000:
+                        continue
+                    nums = struct.unpack('>%dI' % count, fh.read(4 * count))
+                    return [int(x) - 1 for x in nums]
+    except Exception as exc:
+        app_core.warn(f"读取 MP4 关键帧索引失败，回退 ffprobe: {exc}", "exporter")
+    return None
+
+
+def _video_frame_total(path: str) -> int:
+    try:
+        cap = cv2.VideoCapture(path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        cap.release()
+        return total
+    except Exception:
+        return 0
+
+
+def _index_partial(frames, video_path: str, fps: float = 0.0,
+                   ratio: float = 0.95) -> bool:
+    """索引是否只覆盖了前一段（扫全片中途出错时会只拿到前半段）。
+
+    帧数拿不到时用「时长×fps」兜底，避免因为取不到总帧数就把截断索引当成完整的。
+    """
+    if not frames:
+        return True
+    total = _video_frame_total(video_path)
+    if not total and fps > 0:
+        dur = media_duration(video_path)
+        total = int(dur * fps) if dur > 0 else 0
+    return bool(total) and int(frames[-1]) < total * ratio
+
+
 def keyframe_frames(video_path: str, fps: float,
-                    ffmpeg_path: str | None = None) -> list[int]:
-    """关键帧帧号列表（时间戳×fps 折算，CFR 下准确）；只解关键帧，按文件 mtime 缓存。"""
+                    ffmpeg_path: str | None = None,
+                    status_cb=None) -> list[int]:
+    """关键帧帧号列表（时间戳×fps 折算，CFR 下准确）。
+
+    扫描要读完整个文件的包索引，长片很慢，因此结果按「路径+mtime+大小」
+    同时缓存在内存和磁盘（重启程序后不必重扫）。
+    """
     try:
         stat = os.stat(video_path)
         key = (f"{os.path.normcase(os.path.abspath(video_path))}|"
@@ -179,30 +294,81 @@ def keyframe_frames(video_path: str, fps: float,
     if cached is not None:
         return list(cached[1])
 
-    probe = _ffprobe_path(gpu_caps.resolve_ffmpeg_path(ffmpeg_path) if ffmpeg_path else None)
-    frames: list[int] = []
-    if probe and fps > 0:
-        try:
-            res = subprocess.run(
-                [probe, "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
-                 "-show_entries", "frame=best_effort_timestamp_time",
-                 "-of", "csv=p=0", video_path],
-                check=False, capture_output=True, text=True, timeout=600,
-                creationflags=_NO_WINDOW)
-            for line in (res.stdout or "").splitlines():
-                line = line.strip().rstrip(",")
-                if not line:
-                    continue
-                try:
-                    frames.append(int(round(float(line) * fps)))
-                except ValueError:
-                    continue
-        except Exception as exc:
-            app_core.warn(f"关键帧探测失败，无损直通不可用: {exc}", "exporter")
-            frames = []
+    disk = app_core.load_keyframes(key)
+    if disk is not None and not _index_partial(disk, video_path, fps):
+        with _CACHE_LOCK:
+            _KEYFRAME_CACHE[key] = (time.time(), list(disk))
+        return list(disk)
+
+    # 单飞：并发导出（分段导出有多个 worker）时只让一个线程去扫
     with _CACHE_LOCK:
-        _KEYFRAME_CACHE[key] = (time.time(), list(frames))
-    return frames
+        scan_lock = _KEYFRAME_LOCKS.setdefault(key, threading.Lock())
+    with scan_lock:
+        with _CACHE_LOCK:
+            cached = _KEYFRAME_CACHE.get(key)
+        if cached is not None:
+            return list(cached[1])
+        disk = app_core.load_keyframes(key)
+        if disk is not None and not _index_partial(disk, video_path, fps):
+            with _CACHE_LOCK:
+                _KEYFRAME_CACHE[key] = (time.time(), list(disk))
+            return list(disk)
+
+        if status_cb:
+            status_cb("扫描关键帧（长片较慢，只做一次并会记住）…")
+        frames: list[int] = _mp4_keyframes(video_path) or []
+        probe = None
+        if not frames:
+            probe = _ffprobe_path(
+                gpu_caps.resolve_ffmpeg_path(ffmpeg_path) if ffmpeg_path else None)
+        if probe and fps > 0:
+            try:
+                res = subprocess.run(
+                    [probe, "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+                     "-show_entries", "frame=best_effort_timestamp_time",
+                     "-of", "csv=p=0", video_path],
+                    check=False, capture_output=True, text=True, timeout=3600,
+                    creationflags=_NO_WINDOW)
+                for line in (res.stdout or "").splitlines():
+                    line = line.strip().rstrip(",")
+                    if not line:
+                        continue
+                    try:
+                        frames.append(int(round(float(line) * fps)))
+                    except ValueError:
+                        continue
+            except Exception as exc:
+                app_core.warn(f"关键帧探测失败，无损直通不可用: {exc}", "exporter")
+                frames = []
+        if _index_partial(frames, video_path):
+            app_core.warn(
+                f"关键帧索引只覆盖到第 {frames[-1] if frames else 0} 帧"
+                f"（全片约 {_video_frame_total(video_path)} 帧），已丢弃，"
+                f"靠后的片段将无法定位锚点", "exporter")
+            frames = []
+        with _CACHE_LOCK:
+            _KEYFRAME_CACHE[key] = (time.time(), list(frames))
+        if frames:
+            app_core.save_keyframes(key, frames)
+        return frames
+
+
+def _anchor_for(index: int, fps: float, keyframes) -> int:
+    """返回 ≤ index 的最近关键帧帧号，用于把绝对帧号换成相对帧号。
+
+    以关键帧为锚点做输入 seek 才是精确的：seek 到某个关键帧的时间戳后，
+    解码出的第一帧就是该关键帧本身。锚点缺失或跨度异常时返回 0（从头解码）。
+    """
+    if index <= 0 or not keyframes:
+        return 0
+    ks = sorted(keyframes) if isinstance(keyframes, (set, frozenset)) else keyframes
+    i = bisect.bisect_right(ks, index) - 1
+    if i < 0:
+        return 0
+    k = int(ks[i])
+    if k < 0 or index - k > _MAX_GOP_FRAMES:
+        return 0
+    return k
 
 
 # ===============================================================
@@ -214,7 +380,11 @@ def _run_ffmpeg_progress(cmd: list[str], total_frames: int,
                          ratio_base: float = 0.0, ratio_span: float = 1.0,
                          done_offset: int = 0,
                          timeout: float = 7200.0) -> tuple[bool, str]:
-    """跑一个 ffmpeg，解析 `-progress pipe:1`，支持取消。返回 (成功, stderr 摘要)。"""
+    """跑一个 ffmpeg，解析 `-progress pipe:1`，支持取消。
+
+    输出用独立线程读进队列：ffmpeg 在滤镜图初始化阶段完全不输出，
+    直接阻塞读 stdout 会让「取消」和「超时」都失效。
+    """
     stderr_file = tempfile.TemporaryFile()
     try:
         proc = subprocess.Popen(
@@ -225,15 +395,40 @@ def _run_ffmpeg_progress(cmd: list[str], total_frames: int,
         stderr_file.close()
         return False, f"{type(exc).__name__}: {exc}"
 
+    lines: queue.Queue = queue.Queue()
+
+    def _pump():
+        try:
+            if proc.stdout is not None:
+                for raw in proc.stdout:
+                    lines.put(raw)
+        except Exception:
+            pass
+        finally:
+            lines.put(None)
+
+    threading.Thread(target=_pump, daemon=True, name="ffmpeg-progress").start()
+
     deadline = time.perf_counter() + timeout
     cancelled = False
+    rc = -1
     try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
+        while True:
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
                 break
-            line = line.strip()
+            try:
+                raw = lines.get(timeout=0.5)
+            except queue.Empty:
+                if proc.poll() is not None and lines.empty():
+                    break
+                if time.perf_counter() > deadline:
+                    proc.kill()
+                    return False, f"ffmpeg 超时（{timeout:.0f}s）"
+                continue
+            if raw is None:
+                break
+            line = raw.strip()
             if not line or "=" not in line:
                 continue
             key, _, value = line.partition("=")
@@ -244,9 +439,6 @@ def _run_ffmpeg_progress(cmd: list[str], total_frames: int,
                     continue
                 progress_cb(ratio_base + min(1.0, done / total_frames) * ratio_span,
                             done_offset + done)
-            if time.perf_counter() > deadline:
-                proc.kill()
-                return False, f"ffmpeg 超时（{timeout:.0f}s）"
         if cancelled:
             proc.kill()
             proc.wait(timeout=15)
@@ -280,12 +472,23 @@ def _run_ffmpeg_progress(cmd: list[str], total_frames: int,
 
 
 def _hwaccel_input_args(profile: gpu_caps.GpuProfile | None) -> list[str]:
-    """导出用的硬解输入参数（不带 hwaccel_output_format，让滤镜在内存帧上跑）。"""
-    if profile is None or not profile.decode_variant:
+    """导出用的硬解输入参数（只取 -hwaccel，不指定 hwaccel_output_format，
+    让 trim/concat 在内存帧上跑）。
+
+    优先用实测选中的解码变体；若 profile 未做解码实测（例如导出时为了省时间
+    用 probe_decoders=False 拿的缓存），就按 hwaccels 里可用的接口直接选一个，
+    否则导出会悄悄退化成软件解码。
+    """
+    if profile is None:
         return []
-    for v in gpu_caps.build_decode_variants(profile.hwaccels):
-        if v.key == profile.decode_variant and v.hwaccel:
-            return v.hwaccel[:2]
+    if profile.decode_variant:
+        for v in gpu_caps.build_decode_variants(profile.hwaccels):
+            if v.key == profile.decode_variant and v.hwaccel:
+                return v.hwaccel[:2]
+    have = {h.lower() for h in (profile.hwaccels or [])}
+    for name in ("cuda", "qsv", "d3d11va", "dxva2"):
+        if name in have:
+            return ["-hwaccel", name]
     return []
 
 
@@ -335,11 +538,13 @@ def _concat_parts(parts: list[str], out_path: str, ffmpeg: str,
 def _try_copy_export(video_path: str, output_path: str,
                      ranges: list[tuple[int, int]], fps: float,
                      profile, ffmpeg: str, progress_cb=None,
-                     cancel_event=None, workers: int = 4) -> bool:
+                     cancel_event=None, workers: int = 4,
+                     keyframes=None, status_cb=None, include_audio: bool = True) -> bool:
     expected = sum(e - s for s, e in ranges)
     if expected <= 0:
         return False
-    keys = set(keyframe_frames(video_path, fps, ffmpeg_path=ffmpeg))
+    keys = set(keyframes) if keyframes else set(keyframe_frames(
+        video_path, fps, ffmpeg_path=ffmpeg, status_cb=status_cb))
     if not keys:
         return False
 
@@ -389,15 +594,16 @@ def _try_copy_export(video_path: str, output_path: str,
         ok_dur, why = _duration_ok(video_only, expected, fps)
         if not ok_dur:
             got = _video_frame_count(video_only)
-            if got > 0 and abs(got - expected) <= max(2, len(ranges)):
+            if got > 0 and abs(got - expected) <= _count_tolerance(len(ranges)):
                 app_core.info(f"时长校验存疑但帧数正确（{got} vs {expected}），继续", "exporter")
             else:
                 app_core.warn(f"无损直通{why}，改用重编码路径", "exporter")
                 return False
 
-        if _has_audio_stream(video_path, ffmpeg_path=ffmpeg):
+        if include_audio and _has_audio_stream(video_path, ffmpeg_path=ffmpeg):
             _mux_audio_for_ranges(video_path, video_only, output_path, ranges, fps,
-                                  ffmpeg_path=ffmpeg)
+                                  ffmpeg_path=ffmpeg, cancel_event=cancel_event,
+                                  status_cb=status_cb, keyframes=keys)
         else:
             shutil.move(video_only, output_path)
     if progress_cb:
@@ -410,7 +616,8 @@ def _try_copy_export(video_path: str, output_path: str,
 # ===============================================================
 
 def _write_filter_script(path: str, ranges: list[tuple[int, int]], fps: float,
-                         has_audio: bool) -> None:
+                         has_audio: bool, audio_idx: int = 0,
+                         audio_sink: bool = False) -> None:
     lines = []
     labels = []
     for idx, (start, end) in enumerate(ranges):
@@ -418,13 +625,47 @@ def _write_filter_script(path: str, ranges: list[tuple[int, int]], fps: float,
                      f"setpts=PTS-STARTPTS[v{idx}]")
         labels.append(f"[v{idx}]")
         if has_audio:
-            lines.append(f"[0:a]atrim=start={start / fps:.9f}:end={end / fps:.9f},"
+            lines.append(f"[{audio_idx}:a]atrim=start={start / fps:.9f}:end={end / fps:.9f},"
                          f"asetpts=PTS-STARTPTS[a{idx}]")
             labels.append(f"[a{idx}]")
     lines.append("".join(labels) + f"concat=n={len(ranges)}:v=1:a={1 if has_audio else 0}"
                  + ("[outv][outa]" if has_audio else "[outv]"))
+    if has_audio and audio_sink:
+        # 不要音频也要留在滤镜图里（见 _build_filter_cmd 注释），用 anullsink 吃掉，
+        # 否则 ffmpeg 会报 "Error binding filtergraph inputs/outputs"
+        lines.append("[outa]anullsink")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(";\n".join(lines))
+
+
+def _build_filter_cmd(ffmpeg: str, video_path: str, out_path: str, script_path: str,
+                      base: int, rel: list[tuple[int, int]], fps: float, quality: int,
+                      use_gpu: bool, gpu_encoder: str, preset: str | None, profile,
+                      graph_audio: bool, map_audio: bool, silent_audio: bool) -> list[str]:
+    """组装 trim+concat 滤镜命令。
+
+    graph_audio 必须为 True：concat 滤镜在 a=0 且分支较多时只输出极少数帧
+    （实测 100 个单帧分支只出 2 帧）。源没有音频时用 anullsrc 补一路静音，
+    音频是否写进成品由 map_audio 决定。
+    """
+    audio_idx = 1 if silent_audio else 0
+    _write_filter_script(script_path, rel, fps, graph_audio, audio_idx,
+                         audio_sink=not map_audio)
+
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-nostdin",
+           *_hwaccel_input_args(profile)]
+    if base > 0:
+        cmd += ["-ss", f"{base / fps:.6f}"]
+    cmd += ["-i", video_path]
+    if silent_audio:
+        cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+    cmd += ["-filter_complex_script", script_path, "-map", "[outv]"]
+    if map_audio:
+        cmd += ["-map", "[outa]"]
+    cmd += _encode_args(quality, use_gpu, gpu_encoder, ffmpeg, preset)
+    cmd += ["-c:a", "aac"] if map_audio else ["-an"]
+    cmd += ["-progress", "pipe:1", out_path]
+    return cmd
 
 
 def _encode_args(quality: int, use_gpu: bool, gpu_encoder: str,
@@ -433,14 +674,54 @@ def _encode_args(quality: int, use_gpu: bool, gpu_encoder: str,
                                        ffmpeg_path=ffmpeg, preset=preset)
 
 
+def _run_filter_export(ffmpeg: str, video_path: str, output_path: str, base: int,
+                       rel_ranges: list[tuple[int, int]], fps: float, quality: int,
+                       use_gpu: bool, gpu_encoder: str, has_audio: bool,
+                       progress_cb=None, preset: str | None = None,
+                       cancel_event=None, profile=None,
+                       ratio_base: float = 0.02, ratio_span: float = 0.96) -> bool:
+    """跑一次 trim+concat 滤镜导出；base>0 时先 seek 到该帧再解。
+
+    has_audio 只表示「音频要不要写进成品」，滤镜图始终带音频分支。
+    """
+    total_frames = sum(e - s for s, e in rel_ranges)
+    src_audio = _has_audio_stream(video_path, ffmpeg_path=ffmpeg)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        filter_file = os.path.join(tmpdir, "filter.txt")
+        cmd = _build_filter_cmd(ffmpeg, video_path, output_path, filter_file, base,
+                                rel_ranges, fps, quality, use_gpu, gpu_encoder,
+                                preset, profile, graph_audio=True,
+                                map_audio=bool(has_audio) and src_audio,
+                                silent_audio=not src_audio)
+
+        ok, err = _run_ffmpeg_progress(
+            cmd, total_frames, progress_cb=progress_cb, cancel_event=cancel_event,
+            ratio_base=ratio_base, ratio_span=ratio_span, timeout=14400.0)
+    if not ok:
+        enc = gpu_caps.resolve_gpu_encoder(gpu_encoder, ffmpeg_path=ffmpeg) if use_gpu else None
+        app_core.warn(f"滤镜导出失败（编码器 {enc or 'libx264'}）：{err[:300]}", "exporter")
+        if os.path.isfile(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        return False
+    return os.path.isfile(output_path) and os.path.getsize(output_path) > 0
+
+
 def _export_ranges_with_ffmpeg_filters(
         video_path: str, output_path: str, ranges: list[tuple[int, int]],
         fps: float, quality: int, use_gpu: bool, gpu_encoder: str,
         include_audio: bool, progress_cb=None,
         ffmpeg_path: str | None = None, preset: str | None = None,
         cancel_event=None, profile=None,
-        ratio_base: float = 0.02, ratio_span: float = 0.96) -> bool:
-    """单遍滤镜 trim+concat 导出（左闭右开区间）。"""
+        ratio_base: float = 0.02, ratio_span: float = 0.96,
+        keyframes=None, status_cb=None) -> bool:
+    """滤镜 trim+concat 导出（左闭右开区间）。
+
+    区间起点靠后时以最近关键帧为锚点做输入 seek，只解码自己那一段；
+    不对齐就从头解。锚点跑到偏差时会自动退回从头解的版本。
+    """
     if not ranges:
         return False
     try:
@@ -450,35 +731,29 @@ def _export_ranges_with_ffmpeg_filters(
 
     has_audio = include_audio and _has_audio_stream(video_path, ffmpeg_path=ffmpeg)
     total_frames = sum(e - s for s, e in ranges)
+    anchor = _anchor_for(ranges[0][0], fps, keyframes)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        filter_file = os.path.join(tmpdir, "filter.txt")
-        _write_filter_script(filter_file, ranges, fps, has_audio)
-
-        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-nostdin",
-               *_hwaccel_input_args(profile),
-               "-i", video_path,
-               "-filter_complex_script", filter_file, "-map", "[outv]"]
-        if has_audio:
-            cmd += ["-map", "[outa]"]
-        cmd += _encode_args(quality, use_gpu, gpu_encoder, ffmpeg, preset)
-        cmd += ["-c:a", "aac"] if has_audio else ["-an"]
-        cmd += ["-progress", "pipe:1", output_path]
-
-        ok, err = _run_ffmpeg_progress(
-            cmd, total_frames, progress_cb=progress_cb, cancel_event=cancel_event,
-            ratio_base=ratio_base, ratio_span=ratio_span, timeout=14400.0)
-        if not ok:
-            enc = gpu_caps.resolve_gpu_encoder(gpu_encoder, ffmpeg_path=ffmpeg) if use_gpu else None
-            app_core.warn(
-                f"单遍滤镜导出失败（编码器 {enc or 'libx264'}）：{err[:300]}", "exporter")
-            if os.path.isfile(output_path):
-                try:
-                    os.remove(output_path)
-                except OSError:
-                    pass
+    for base in ([anchor, 0] if anchor else [0]):
+        if status_cb:
+            status_cb("滤镜编码中…" if base == 0
+                      else f"滤镜编码中（从第 {base} 帧起解）…")
+        rel = [(s - base, e - base) for s, e in ranges]
+        if not _run_filter_export(ffmpeg, video_path, output_path, base, rel, fps,
+                                 quality, use_gpu, gpu_encoder, has_audio,
+                                 progress_cb, preset, cancel_event, profile,
+                                 ratio_base, ratio_span):
             return False
-        return os.path.isfile(output_path) and os.path.getsize(output_path) > 0
+        if base == 0:
+            return True
+        ok_dur, why = _duration_ok(output_path, total_frames, fps)
+        if ok_dur:
+            return True
+        app_core.warn(f"定位导出{why}，改用从头解码重试", "exporter")
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+    return False
 
 
 # ===============================================================
@@ -487,47 +762,87 @@ def _export_ranges_with_ffmpeg_filters(
 
 def _mux_audio_for_ranges(video_path: str, video_only_path: str,
                           output_path: str, ranges: list[tuple[int, int]],
-                          fps: float, ffmpeg_path: str | None = None) -> None:
+                          fps: float, ffmpeg_path: str | None = None,
+                          cancel_event=None, status_cb=None,
+                          keyframes=None) -> None:
+    """把原片对应区间的音频剪出来，与 video_only_path 合成 output_path。
+
+    区间多时必须分组：音频滤镜里每个 atrim 分支都会过一遍所有音频帧，
+    几千个区间塞进一张图会慢到几十分钟（而且没有任何输出）。
+    """
     if not _has_audio_stream(video_path, ffmpeg_path=ffmpeg_path):
         os.replace(video_only_path, output_path)
         return
 
     ffmpeg = gpu_caps.resolve_ffmpeg_path(ffmpeg_path)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        filter_file = os.path.join(tmpdir, "audio-filter.txt")
-        lines = []
-        labels = []
-        for idx, (start, end) in enumerate(ranges):
-            lines.append(f"[0:a]atrim=start={start / fps:.9f}:end={end / fps:.9f},"
-                         f"asetpts=PTS-STARTPTS[a{idx}]")
-            labels.append(f"[a{idx}]")
-        lines.append("".join(labels) + f"concat=n={len(ranges)}:v=0:a=1[outa]")
-        with open(filter_file, "w", encoding="utf-8") as fh:
-            fh.write(";\n".join(lines))
+    n_groups = max(1, -(-len(ranges) // _MAX_RANGES_PER_CHUNK))
+    per = -(-len(ranges) // n_groups)
 
-        try:
-            # 不能用 -shortest：音频按 AAC 包粒度对齐会比视频略短，会裁掉尾部视频帧
-            subprocess.run(
-                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-nostdin",
-                 "-i", video_path, "-i", video_only_path,
-                 "-filter_complex_script", filter_file,
-                 "-map", "1:v:0", "-map", "[outa]",
-                 "-c:v", "copy", "-c:a", "aac", output_path],
-                check=True, capture_output=True, timeout=3600,
-                creationflags=_NO_WINDOW)
-        except Exception as exc:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        parts: list[str] = []
+        for gi in range(n_groups):
+            group = ranges[gi * per:(gi + 1) * per]
+            if not group:
+                continue
+            if cancel_event is not None and cancel_event.is_set():
+                raise ExportCancelled("已取消导出")
+            base = _anchor_for(group[0][0], fps, keyframes) if keyframes else 0
+            rel = [(s - base, e - base) for s, e in group]
+            script = os.path.join(tmpdir, f"a{gi:03d}.txt")
+            lines, labels = [], []
+            for i, (s, e) in enumerate(rel):
+                lines.append(f"[0:a]atrim=start={s / fps:.9f}:end={e / fps:.9f},"
+                             f"asetpts=PTS-STARTPTS[a{i}]")
+                labels.append(f"[a{i}]")
+            lines.append("".join(labels) + f"concat=n={len(rel)}:v=0:a=1[outa]")
+            with open(script, "w", encoding="utf-8") as fh:
+                fh.write(";\n".join(lines))
+
+            part = os.path.join(tmpdir, f"a{gi:03d}.m4a")
+            cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+                   "-nostdin"]
+            if base > 0:
+                cmd += ["-ss", f"{base / fps:.6f}"]
+            cmd += ["-i", video_path, "-filter_complex_script", script,
+                    "-map", "[outa]", "-c:a", "aac", "-b:a", "192k", part]
+            ok, err = _run_ffmpeg_progress(cmd, 0, cancel_event=cancel_event,
+                                           timeout=7200.0)
+            if not ok:
+                raise RuntimeError(f"音频切片失败: {err[:300]}")
+            parts.append(part)
+            if status_cb:
+                status_cb(f"混流音频 {gi + 1}/{n_groups}…")
+
+        if len(parts) == 1:
+            audio_all = parts[0]
+        else:
+            list_file = os.path.join(tmpdir, "alist.txt")
+            with open(list_file, "w", encoding="utf-8") as fh:
+                for p in parts:
+                    fh.write("file '" + p.replace("'", "'\\''") + "'\n")
+            audio_all = os.path.join(tmpdir, "audio.m4a")
+            ok, err = _run_ffmpeg_progress(
+                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+                 "-nostdin", "-f", "concat", "-safe", "0", "-i", list_file,
+                 "-c", "copy", audio_all],
+                0, cancel_event=cancel_event, timeout=3600.0)
+            if not ok:
+                raise RuntimeError(f"音频拼接失败: {err[:300]}")
+
+        # 不能用 -shortest：音频按 AAC 包粒度会比视频略短，会把尾部视频帧裁掉
+        ok, err = _run_ffmpeg_progress(
+            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-nostdin",
+             "-i", video_only_path, "-i", audio_all,
+             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "copy",
+             output_path],
+            0, cancel_event=cancel_event, timeout=3600.0)
+        if not ok:
             if os.path.isfile(output_path):
                 try:
                     os.remove(output_path)
                 except OSError:
                     pass
-            stderr = b""
-            if isinstance(exc, subprocess.CalledProcessError):
-                stderr = exc.stderr or b""
-            if stderr:
-                raise RuntimeError(
-                    f"音频混流失败: {stderr.decode('utf-8', errors='ignore')[:400]}") from exc
-            raise
+            raise RuntimeError(f"音频混流失败: {err[:300]}")
 
 
 # ===============================================================
@@ -597,7 +912,7 @@ def _export_per_frame(video_path: str, output_path: str, to_del: np.ndarray,
                       fps: float, quality: int, progress_cb=None,
                       use_gpu: bool = False, gpu_encoder: str = "",
                       ffmpeg_path: str | None = None, preset: str | None = None,
-                      avoid_seek: bool = False):
+                      avoid_seek: bool = False, include_audio: bool = True):
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     ranges = _kept_frame_ranges(to_del)
@@ -688,8 +1003,11 @@ def _export_per_frame(video_path: str, output_path: str, to_del: np.ndarray,
 
     if use_ffmpeg:
         try:
-            _mux_audio_for_ranges(video_path, video_only_path, output_path,
-                                  ranges, fps, ffmpeg_path=ffmpeg_bin)
+            if include_audio:
+                _mux_audio_for_ranges(video_path, video_only_path, output_path,
+                                      ranges, fps, ffmpeg_path=ffmpeg_bin)
+            else:
+                os.replace(video_only_path, output_path)
         finally:
             if video_only_path != output_path and os.path.isfile(video_only_path):
                 try:
@@ -711,8 +1029,8 @@ def export_video(video_path: str, output_path: str, to_del,
                  export_workers: int | None = None,
                  keyframe_copy: bool = True,
                  cancel_event: threading.Event | None = None,
-                 profile=None):
-    """整段剪辑导出。返回 (written, total)。"""
+                 profile=None, status_cb=None, export_audio: bool = True):
+    """整段剪辑导出。返回 (written, total)。export_audio=False 则不处理音频。"""
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
@@ -742,23 +1060,34 @@ def export_video(video_path: str, output_path: str, to_del,
         ffmpeg_bin = None
 
     if ffmpeg_bin:
+        keys = None
         if keyframe_copy:
+            try:
+                keys = keyframe_frames(video_path, fps, ffmpeg_path=ffmpeg_bin,
+                                       status_cb=status_cb)
+            except Exception as exc:
+                app_core.warn(f"关键帧索引不可用，跳过无损直通: {exc}", "exporter")
+
+        if keys:
             try:
                 if _try_copy_export(video_path, output_path, ranges, fps, profile,
                                     ffmpeg_bin, progress_cb, cancel_event,
-                                    workers=max(2, workers)):
+                                    workers=max(2, workers), keyframes=keys,
+                                    status_cb=status_cb, include_audio=export_audio):
                     return written_fast, total
             except ExportCancelled:
                 raise
             except Exception as exc:
                 app_core.warn(f"无损直通异常，回退重编码: {exc}", "exporter")
 
-        if workers > 1 and len(ranges) >= _CHUNK_MIN_SEGMENTS:
+        if workers > 1 and len(ranges) > _MAX_RANGES_PER_CHUNK:
             try:
                 if _export_chunks_parallel(video_path, output_path, ranges, fps,
                                            quality, use_gpu, gpu_encoder, ffmpeg_bin,
                                            workers, export_preset, progress_cb,
-                                           cancel_event, profile):
+                                           cancel_event, profile, keyframes=keys,
+                                           status_cb=status_cb,
+                                           include_audio=export_audio):
                     return written_fast, total
             except ExportCancelled:
                 raise
@@ -767,14 +1096,15 @@ def export_video(video_path: str, output_path: str, to_del,
 
         if _export_ranges_with_ffmpeg_filters(
                 video_path, output_path, ranges, fps, quality, use_gpu,
-                gpu_encoder, True, progress_cb, ffmpeg_path=ffmpeg_bin,
-                preset=export_preset, cancel_event=cancel_event, profile=profile):
+                gpu_encoder, export_audio, progress_cb, ffmpeg_path=ffmpeg_bin,
+                preset=export_preset, cancel_event=cancel_event, profile=profile,
+                keyframes=keys, status_cb=status_cb):
             return written_fast, total
 
     written, tot = _export_per_frame(
         video_path, output_path, to_del, fps, quality, progress_cb,
         use_gpu=use_gpu, gpu_encoder=gpu_encoder, ffmpeg_path=ffmpeg_path,
-        preset=export_preset)
+        preset=export_preset, include_audio=export_audio)
     return written, tot
 
 
@@ -782,45 +1112,50 @@ def _export_chunks_parallel(video_path: str, output_path: str,
                             ranges: list[tuple[int, int]], fps: float,
                             quality: int, use_gpu: bool, gpu_encoder: str,
                             ffmpeg: str, workers: int, preset: str | None,
-                            progress_cb, cancel_event, profile) -> bool:
+                            progress_cb, cancel_event, profile,
+                            keyframes=None, status_cb=None,
+                            include_audio: bool = True) -> bool:
     """按块并行重编码再 concat。
 
-    每块用输入 seek 到该块首段起点，块内 trim 用相对帧号，
-    因此每块只解码自己那一段区间。
+    块大小按「最多 _MAX_RANGES_PER_CHUNK 个区间」切，而不是按并发数切：
+    区间一多滤镜图初始化就极慢且期间没有任何进度输出。每块以关键帧为锚点
+    做输入 seek，块内 trim 用相对帧号，因此只解码自己那一段。
     """
     expected = sum(e - s for s, e in ranges)
-    n_chunks = max(1, min(workers, (len(ranges) + _CHUNK_MIN_SEGMENTS - 1) // _CHUNK_MIN_SEGMENTS))
-    per = (len(ranges) + n_chunks - 1) // n_chunks
+    # 块数同时受两头约束：至少要够喂满并发（每块固定开销不小），
+    # 每块区间数又不能太多（每个 trim 分支都要过一遍解码流）
+    n_chunks = max(workers, -(-len(ranges) // _MAX_RANGES_PER_CHUNK))
+    per = -(-len(ranges) // n_chunks)
     chunks = [ranges[i:i + per] for i in range(0, len(ranges), per)]
     n_chunks = len(chunks)
     if n_chunks < 2:
         return False
 
-    has_audio = _has_audio_stream(video_path, ffmpeg_path=ffmpeg)
+    src_audio = _has_audio_stream(video_path, ffmpeg_path=ffmpeg)
+    has_audio = include_audio and src_audio
     enc = gpu_caps.resolve_gpu_encoder(gpu_encoder, ffmpeg_path=ffmpeg) if use_gpu else None
-    app_core.info(f"分块并行导出：{n_chunks} 块 / 并发 {min(workers, n_chunks)} / "
+    concurrency = max(1, min(workers, n_chunks))
+    app_core.info(f"分块并行导出：{n_chunks} 块 / 并发 {concurrency} / "
                   f"编码器 {enc or 'libx264'}", "exporter")
+    if status_cb:
+        status_cb(f"分块编码 0/{n_chunks}（并发 {concurrency}）")
+    chunk_t0 = time.perf_counter()
 
     with tempfile.TemporaryDirectory(prefix="aae_chunk_") as tmpdir:
         parts = [os.path.join(tmpdir, f"c{i:03d}.mp4") for i in range(n_chunks)]
         progress = [0.0] * n_chunks
+        finished = [0]
         lock = threading.Lock()
 
         def run_chunk(ci: int) -> bool:
             chunk = chunks[ci]
-            base = chunk[0][0]
+            base = _anchor_for(chunk[0][0], fps, keyframes)
             rel = [(s - base, e - base) for s, e in chunk]
             filter_file = os.path.join(tmpdir, f"f{ci:03d}.txt")
-            _write_filter_script(filter_file, rel, fps, has_audio)
-            cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
-                   "-nostdin", *_hwaccel_input_args(profile),
-                   "-ss", f"{base / fps:.6f}", "-i", video_path,
-                   "-filter_complex_script", filter_file, "-map", "[outv]"]
-            if has_audio:
-                cmd += ["-map", "[outa]"]
-            cmd += _encode_args(quality, use_gpu, gpu_encoder, ffmpeg, preset)
-            cmd += ["-c:a", "aac"] if has_audio else ["-an"]
-            cmd += ["-progress", "pipe:1", parts[ci]]
+            cmd = _build_filter_cmd(ffmpeg, video_path, parts[ci], filter_file, base,
+                                    rel, fps, quality, use_gpu, gpu_encoder, preset,
+                                    profile, graph_audio=True, map_audio=has_audio,
+                                    silent_audio=not src_audio)
 
             chunk_total = sum(e - s for s, e in rel)
 
@@ -833,11 +1168,18 @@ def _export_chunks_parallel(video_path: str, output_path: str,
             ok, err = _run_ffmpeg_progress(
                 cmd, chunk_total, progress_cb=_prog, cancel_event=cancel_event,
                 ratio_base=0.0, ratio_span=1.0, timeout=14400.0)
+            with lock:
+                finished[0] += 1
+                done_n = finished[0]
             if not ok:
                 app_core.warn(f"块 {ci + 1}/{n_chunks} 编码失败：{err[:200]}", "exporter")
+            elif status_cb:
+                used = time.perf_counter() - chunk_t0
+                status_cb(f"分块编码 {done_n}/{n_chunks}（并发 {concurrency}，"
+                          f"已用 {int(used // 60)}:{int(used % 60):02d}）")
             return ok
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, n_chunks)) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
             results = list(ex.map(run_chunk, range(n_chunks)))
         if cancel_event is not None and cancel_event.is_set():
             raise ExportCancelled("已取消导出")
@@ -851,17 +1193,17 @@ def _export_chunks_parallel(video_path: str, output_path: str,
         ok_dur, why = _duration_ok(video_only, expected, fps, tolerance_frames=1.5)
         if not ok_dur:
             got = _video_frame_count(video_only)
-            if got > 0 and abs(got - expected) <= max(2, len(ranges)):
+            if got > 0 and abs(got - expected) <= _count_tolerance(len(ranges)):
                 app_core.info(f"时长校验存疑但帧数正确（{got} vs {expected}），继续", "exporter")
             else:
                 app_core.warn(f"分块导出{why}，回退单遍滤镜", "exporter")
                 return False
 
-        if has_audio:
-            _mux_audio_for_ranges(video_path, video_only, output_path, ranges, fps,
-                                  ffmpeg_path=ffmpeg)
-        else:
-            shutil.move(video_only, output_path)
+        # 每块已经带了音频，合好的文件就是成品；这里绝不能再用整段音频滤镜
+        # 重新剪音频：那会让每个音频帧都过一遍全部区间分支（几千个 atrim）。
+        if status_cb:
+            status_cb("写入文件…")
+        shutil.move(video_only, output_path)
     if progress_cb:
         progress_cb(1.0, expected)
     return True
@@ -874,10 +1216,11 @@ def export_ranges(video_path: str, output_path: str, ranges: list,
                   export_preset: str | None = None,
                   keyframe_copy: bool = True,
                   cancel_event: threading.Event | None = None,
-                  profile=None):
+                  profile=None, status_cb=None, export_audio: bool = True):
     """导出一组区间为一个文件（ranges 为左闭右闭的 (start, end)）。
 
-    分段导出走这里：单段且起点是关键帧时用无损 copy，几乎瞬时。
+    分段导出走这里：起点对齐关键帧时用无损 copy；否则滤镜编码会先 seek 到
+    该段之前的关键帧，只解码这一段，而不是从视频第 0 帧解到段尾。
     """
     if not ranges:
         return 0, 0
@@ -895,10 +1238,20 @@ def export_ranges(video_path: str, output_path: str, ranges: list,
         except Exception:
             profile = None
 
+    keys = None
     if ffmpeg_bin and keyframe_copy:
         try:
+            keys = keyframe_frames(video_path, fps, ffmpeg_path=ffmpeg_bin,
+                                   status_cb=status_cb)
+        except Exception as exc:
+            app_core.warn(f"关键帧索引不可用: {exc}", "exporter")
+
+    if ffmpeg_bin and keys:
+        try:
             if _try_copy_export(video_path, output_path, exclusive, fps, profile,
-                                ffmpeg_bin, progress_cb, cancel_event, workers=2):
+                                ffmpeg_bin, progress_cb, cancel_event, workers=2,
+                                keyframes=keys, status_cb=status_cb,
+                                include_audio=export_audio):
                 return total_frames_to_export, total_frames_to_export
         except ExportCancelled:
             raise
@@ -907,9 +1260,9 @@ def export_ranges(video_path: str, output_path: str, ranges: list,
 
     if ffmpeg_bin and _export_ranges_with_ffmpeg_filters(
             video_path, output_path, exclusive, fps, quality,
-            use_gpu, gpu_encoder, False, progress_cb, ffmpeg_path=ffmpeg_bin,
+            use_gpu, gpu_encoder, export_audio, progress_cb, ffmpeg_path=ffmpeg_bin,
             preset=export_preset, cancel_event=cancel_event, profile=profile,
-            ratio_base=0.02, ratio_span=0.96):
+            ratio_base=0.02, ratio_span=0.96, keyframes=keys, status_cb=status_cb):
         return total_frames_to_export, total_frames_to_export
 
     cap = cv2.VideoCapture(video_path)

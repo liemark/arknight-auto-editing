@@ -91,9 +91,11 @@ def classify_gray(gray: np.ndarray, configs: dict,
         return FRAME_TYPE_1X
     if x2s >= thresholds['speed_2x'] and x2s > x1s:
         return FRAME_TYPE_2X
-    if configs['speed_0_2x'] and get_best_score(gray, configs['speed_0_2x'],
-                                               proc_res) >= thresholds['speed_0_2x']:
-        return FRAME_TYPE_0_2X
+    if configs['speed_0_2x']:
+        s02 = get_best_score(gray, configs['speed_0_2x'], proc_res)
+        # 0.2x 模板是「正在播放」图标，1x/2x 帧上也会高分，所以必须是三者最高
+        if s02 >= thresholds['speed_0_2x'] and s02 > max(x1s, x2s):
+            return FRAME_TYPE_0_2X
     return FRAME_TYPE_NORMAL
 
 
@@ -130,7 +132,11 @@ def classify_from_scores(scores: dict, has_cat: dict, thresholds: dict) -> np.nd
     out[m2] = FRAME_TYPE_2X
 
     if has_cat.get('speed_0_2x') and 'speed_0_2x' in scores:
-        m02 = pending & ~m1 & ~m2 & (scores['speed_0_2x'] >= thresholds['speed_0_2x'])
+        # 0.2x 的模板是「正在播放」图标，1x/2x 帧上也可能高分，因此要求它
+        # 必须是三个速度类里最高的那个，否则会把 2 倍速判成 0.2 倍速
+        s02 = scores['speed_0_2x']
+        best_speed = np.maximum(x1s, x2s)
+        m02 = pending & ~m1 & ~m2 & (s02 >= thresholds['speed_0_2x']) & (s02 > best_speed)
         out[m02] = FRAME_TYPE_0_2X
     return out
 
@@ -602,6 +608,19 @@ def autotune(compiled: CompiledTemplates, configs: dict, thresholds: dict,
 
     n = len(sample)
     ref_scores = _scores_legacy(sample, configs, proc_res)
+    # 基准本身必须可信：cv2 的带掩码 TM_CCOEFF_NORMED 在个别环境下会给出非有限值，
+    # get_best_score 会因此跳过所有模板（分数全 -1）→ 漏判暂停；此时它就是错的，
+    # 不能拿它去否定其它后端（否则正确后端会被全部判掉，最后选中一个坏基准）。
+    ref_np = scores_batch(sample, compiled, BACKEND_CPU_BATCH, configs, proc_res)
+    ref_deltas = [float(np.max(np.abs(ref_scores[c] - ref_np[c]))) for c in _CATEGORIES
+                  if ref_scores.get(c) is not None and ref_np.get(c) is not None]
+    cv2_ref_delta = max(ref_deltas) if ref_deltas else 0.0
+    cv2_trusted = cv2_ref_delta <= 1e-3
+    if not cv2_trusted:
+        app_core.warn(
+            f"cv2 直算与内置 NCC 基准不一致（max|Δ|={cv2_ref_delta:.2e}），"
+            f"改用内置 NCC 作基准，并排除 cv2 直算（否则会漏判暂停）", "matcher")
+        ref_scores = ref_np
     ref_states = classify_from_scores(ref_scores, compiled.has, thresholds)
 
     pool = candidates if candidates is not None else available_backends(profile)
@@ -610,6 +629,10 @@ def autotune(compiled: CompiledTemplates, configs: dict, thresholds: dict,
         r = BenchResult(backend=backend, ok=False, frames=n)
         if backend == BACKEND_CPU_POOL:
             r.error = "不参与自动测速（兼容保留）"
+            results.append(r)
+            continue
+        if not cv2_trusted and backend == BACKEND_CV2_DIRECT:
+            r.error = "cv2 实现与本程序内置 NCC 不一致，已排除（避免漏判暂停）"
             results.append(r)
             continue
         try:

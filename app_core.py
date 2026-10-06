@@ -20,6 +20,7 @@ _APP_DIR_NAME = "arknight-auto-editing"
 CONFIG_FILE = "config.json"
 GPU_PROFILE_FILE = "gpu_profile.json"
 BENCH_FILE = "bench.json"
+KEYFRAMES_FILE = "keyframes.json"
 
 _lock = threading.RLock()
 _home_cache: str | None = None
@@ -209,8 +210,26 @@ def save_bench(bench: dict) -> bool:
     return _write_json(BENCH_FILE, bench)
 
 
+def load_keyframes(key: str) -> list[int] | None:
+    """关键帧索引缓存（长片扫描很慢，重启后不该重扫）。"""
+    entry = _read_json(KEYFRAMES_FILE).get(key)
+    if not isinstance(entry, dict):
+        return None
+    frames = entry.get("frames")
+    return list(frames) if isinstance(frames, list) and frames else None
+
+
+def save_keyframes(key: str, frames: list[int]) -> bool:
+    data = _read_json(KEYFRAMES_FILE)
+    data[key] = {"when": time.time(), "frames": list(frames)}
+    if len(data) > 8:
+        for k in sorted(data, key=lambda x: data[x].get("when", 0))[:-8]:
+            data.pop(k, None)
+    return _write_json(KEYFRAMES_FILE, data)
+
+
 def clear_caches() -> None:
-    for name in (GPU_PROFILE_FILE, BENCH_FILE):
+    for name in (GPU_PROFILE_FILE, BENCH_FILE, KEYFRAMES_FILE):
         p = _path(name)
         try:
             if os.path.isfile(p):

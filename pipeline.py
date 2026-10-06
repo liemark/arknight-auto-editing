@@ -595,8 +595,9 @@ def analyze_video_with_context(
             idx += len(batch)
 
             if progress_cb:
+                # 二次扫片已不需要，解码+匹配就是全部工作量，进度直接走到 100%
                 denom = max(1, total_alloc if total_alloc > 0 else idx)
-                progress_cb(min(0.5, (idx / denom) * 0.5))
+                progress_cb(min(1.0, idx / denom))
     finally:
         src.close()
 
