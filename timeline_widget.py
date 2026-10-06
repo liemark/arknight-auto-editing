@@ -37,8 +37,6 @@ class TimelineWidget(tk.Frame):
         self.on_seek_cb = None
         self.on_handle_end_cb = None
         self.on_pause_select_cb = None
-        # 掩码/裁剪手柄被改动时通知外部（预览侧据此失效「跳过区快照」缓存）
-        self.on_mask_changed_cb = None
 
         self._tl_static_photo = None
         self._tl_dirty = True
@@ -154,20 +152,18 @@ class TimelineWidget(tk.Frame):
                 if mask is None:
                     pfill(xs, xe, col_map[0])
                 else:
-                    # 游程分块用 np.diff 向量化，避免整层重建时逐像素循环
-                    arr = np.asarray(mask)
-                    if arr.size == 0:
-                        pfill(xs, xe, col_map[0])
-                    else:
-                        change = np.flatnonzero(np.diff(arr.astype(np.int8))) + 1
-                        run_starts = np.concatenate(([0], change))
-                        run_ends = np.concatenate((change, [arr.size]))
-                        run_vals = arr[run_starts]
-                        base = int(seg['start'])
-                        for st, en, cur in zip(run_starts, run_ends, run_vals):
-                            pfill(self._f2x(base + int(st), w),
-                                  self._f2x(base + int(en), w),
-                                  col_map.get(int(cur), col_map[0]))
+                    cur = mask[0]
+                    st = 0
+                    for i in range(1, len(mask)):
+                        if mask[i] != cur:
+                            fxs = self._f2x(seg['start'] + st, w)
+                            fxe = self._f2x(seg['start'] + i, w)
+                            pfill(fxs, fxe, col_map.get(cur, col_map[0]))
+                            cur = mask[i]
+                            st = i
+                    fxs = self._f2x(seg['start'] + st, w)
+                    fxe = self._f2x(seg['start'] + len(mask), w)
+                    pfill(fxs, fxe, col_map.get(cur, col_map[0]))
 
             # 画选中高亮底边指示
             if getattr(self, 'selected_pause_id', None) == seg['id']:
@@ -380,8 +376,6 @@ class TimelineWidget(tk.Frame):
                             mask[s_i:e_i + 1] = target_val
                             self.mark_dirty()
                             self._draw_dynamic()
-                            if self.on_mask_changed_cb:
-                                self.on_mask_changed_cb()
                     break
 
     def _on_mousemove(self, event):
@@ -409,8 +403,6 @@ class TimelineWidget(tk.Frame):
         elif kind == 'clip_out':
             self._move_clip_handle(self.active_handle[1], 'out', tf)
 
-        if self.on_mask_changed_cb:
-            self.on_mask_changed_cb()
         self.mark_dirty()
         self._draw_dynamic()
 

@@ -1,13 +1,4 @@
 # gpu_caps.py —— GPU / FFmpeg 能力探测、编码参数、解码变体、可选 CUDA 加速包
-#
-# 所有能力都靠实测得出，而不是查表：不同 ffmpeg 构建与驱动下，
-# 列表里存在的编码器/加速方式实际上可能初始化失败。
-#
-# 厂商路径：
-#   NVIDIA  解码 cuda(NVDEC) / 缩放 scale_cuda→scale_npp→swscale / 编码 *_nvenc
-#   AMD     解码 d3d11va→dxva2 / 缩放 swscale / 编码 *_amf
-#   Intel   解码 qsv / 缩放 scale_qsv→vpp_qsv→swscale / 编码 *_qsv
-#   兜底    软件解码 + swscale + libx264
 
 from __future__ import annotations
 
@@ -79,6 +70,7 @@ _FFMPEG_INFO_CACHE: dict[str, dict] = {}
 _ENCODER_CACHE: dict[str, bool] = {}
 _PROFILE_LOCK = threading.Lock()
 _PROFILE_MEM: dict | None = None
+_PROFILE_MEM_FULL = False       # 内存缓存是否来自完整探测（含解码实测）
 
 _BUNDLED_FFMPEG_NAMES = ("ffmpeg.exe", "ffmpeg") if sys.platform == "win32" else ("ffmpeg",)
 
@@ -557,6 +549,11 @@ def _dll_directories(root: str) -> list[str]:
 def _register_paths(root: str) -> None:
     if root not in sys.path:
         sys.path.insert(0, root)
+    try:
+        import site
+        site.addsitedir(root)
+    except Exception:
+        pass
     if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
         for d in _dll_directories(root):
             try:
@@ -598,6 +595,8 @@ def _probe_torch_module(torch) -> dict:
 def load_torch(force: bool = False):
     """返回 torch 模块或 None；结果（含失败原因）缓存。"""
     global _torch_module, _torch_status
+    # 加速包里的 torch 自带 Intel OpenMP 运行库；与进程里已有的副本同时存在时，某些版本会直接 abort（0xC0000409）而不是抛异常，这里先放行重复加载。
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     with _pack_lock:
         if not force and _torch_status is not None:
             return _torch_module
@@ -609,6 +608,7 @@ def load_torch(force: bool = False):
             module = torch
         except Exception as exc:
             first_error = f"{type(exc).__name__}: {exc}"
+            pack_errors: list[str] = []
             for d in _search_dirs():
                 if not _has_torch_package(d):
                     continue
@@ -621,13 +621,17 @@ def load_torch(force: bool = False):
                     source = d
                     break
                 except Exception as exc2:
+                    pack_errors.append(f"{type(exc2).__name__}: {exc2}")
                     app_core.warn(f"从 {d} 加载 torch 失败: {type(exc2).__name__}: {exc2}",
                                   "gpu")
             if module is None:
                 _torch_module = None
+                # 加速包存在但导入失败时，包内导入的错误才是关键信息
+                reason = ("加速包加载失败：" + " / ".join(dict.fromkeys(pack_errors))
+                          if pack_errors else f"内置导入失败：{first_error}")
                 _torch_status = {"installed": False, "version": "", "cuda_available": False,
                                  "device_name": "", "cuda_version": "", "torch_dml": False,
-                                 "reason": f"未找到可用的 torch（{first_error}）"}
+                                 "reason": reason}
                 return None
 
         _torch_module = module
@@ -846,8 +850,10 @@ def install_with_uv(progress_cb=None, cancel_event=None,
     if progress_cb:
         progress_cb(1.0, "完成")
     st = torch_status(refresh=True)
+    if not st.get("installed"):
+        return False, f"torch 已下载到 {target}，但导入失败：{st.get('reason', '')}"
     if not st.get("cuda_available"):
-        return False, f"torch 已安装但 CUDA 不可用：{st.get('reason', '')}"
+        return False, f"torch 已导入但 CUDA 不可用：{st.get('reason', '')}"
     return True, f"已启用 CUDA 匹配加速（torch {st.get('version')} / {st.get('device_name')}）"
 
 
@@ -935,9 +941,12 @@ def _default_workers(vendor: str) -> int:
     return max(1, cpu_count() // 2)
 
 
+_CACHE_VERSION = 2          # 变更探测内容/键格式时递增，旧缓存自动失效
+
+
 def _cache_key(ffmpeg_path: str, version: str, device: str, torch_sig: str = "") -> str:
-    return "|".join([os.path.normcase(ffmpeg_path or ""), version or "", device or "",
-                     torch_sig or ""])
+    return f"v{_CACHE_VERSION}|" + "|".join(
+        [os.path.normcase(ffmpeg_path or ""), version or "", device or "", torch_sig or ""])
 
 
 def _torch_sig(torch_st: dict) -> str:
@@ -1039,17 +1048,20 @@ def _probe_impl(ffmpeg_path: str | None = None,
         label = next((r["label"] for r in profile.decode_variants
                       if r["key"] == profile.decode_variant), profile.decode_variant)
         app_core.info(f"硬件解码可用：{label}", "gpu")
-    else:
+    elif probe_decoders:
         app_core.warn("没有实测可用的硬件解码路径，分析将使用软件解码", "gpu")
     return profile
 
 
 def detect(ffmpeg_path: str | None = None, force: bool = False,
            probe_decoders: bool = True, use_cache: bool = True) -> GpuProfile:
-    """探测并返回 GpuProfile（缓存命中条件：ffmpeg 路径+版本+设备名一致）。"""
-    global _PROFILE_MEM
+    """探测并返回 GpuProfile（缓存命中条件：ffmpeg 路径+版本+设备名+torch 状态）。"""
+    global _PROFILE_MEM, _PROFILE_MEM_FULL
     with _PROFILE_LOCK:
-        if not force and _PROFILE_MEM is not None and use_cache:
+        # 只有「完整探测过」的内存结果才能满足完整探测请求，
+        # 否则 probe_decoders=False 的降级结果会把后续分析也带偏。
+        if (not force and _PROFILE_MEM is not None and use_cache
+                and (_PROFILE_MEM_FULL or not probe_decoders)):
             return _PROFILE_MEM
 
     cached = app_core.load_gpu_profile() if (use_cache and not force) else {}
@@ -1066,6 +1078,7 @@ def detect(ffmpeg_path: str | None = None, force: bool = False,
                 prof.from_cache = True
                 with _PROFILE_LOCK:
                     _PROFILE_MEM = prof
+                    _PROFILE_MEM_FULL = True       # 只有完整探测才会落盘
                 return prof
         except FileNotFoundError:
             pass
@@ -1074,9 +1087,13 @@ def detect(ffmpeg_path: str | None = None, force: bool = False,
     data = prof.to_dict()
     data["_key"] = _cache_key(prof.ffmpeg_path, prof.ffmpeg_version, prof.device_name,
                               _torch_sig(prof.torch))
-    app_core.save_gpu_profile(data)
+    # 只在做过解码实测时才落盘：probe_decoders=False 拿到的是降级结果，
+    # 写进缓存会让后续分析/导出永久退化成软件解码。
+    if probe_decoders:
+        app_core.save_gpu_profile(data)
     with _PROFILE_LOCK:
         _PROFILE_MEM = prof
+        _PROFILE_MEM_FULL = bool(probe_decoders)
     return prof
 
 

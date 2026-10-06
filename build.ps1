@@ -7,7 +7,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Root = Split-Path -Parent $PSScriptRoot
+$Root = if (Test-Path (Join-Path $PSScriptRoot 'pyproject.toml')) {
+    $PSScriptRoot
+} else {
+    Split-Path -Parent $PSScriptRoot
+}
 Set-Location $Root
 
 # Child tools (python/pyinstaller) print UTF-8; without this the console decodes
@@ -46,6 +50,38 @@ Info "version $version -> exe name $exeName"
 $py = Join-Path $Root '.venv\Scripts\python.exe'
 if (-not (Test-Path $py)) { $py = 'python' }
 
+# 打包用的小脚本（内联，避免额外文件）：zip 目录并校验 UTF-8 名字标志位
+$ZipCode = @'
+import os, sys, zipfile
+src, dst = sys.argv[1], sys.argv[2]
+if os.path.isfile(dst):
+    os.remove(dst)
+count = 0
+total = 0
+with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    for root, dirs, files in os.walk(src):
+        dirs.sort()
+        files.sort()
+        rel = os.path.relpath(root, src)
+        if rel != ".":
+            z.writestr(rel.replace(os.sep, "/") + "/", b"")
+        for name in files:
+            full = os.path.join(root, name)
+            z.write(full, os.path.relpath(full, src).replace(os.sep, "/"))
+            count += 1
+            total += os.path.getsize(full)
+with zipfile.ZipFile(dst) as z:
+    if z.testzip():
+        print("ERROR: corrupt entry in", dst)
+        sys.exit(1)
+    for info in z.infolist():
+        if not info.filename.isascii() and not (info.flag_bits & 0x800):
+            print("ERROR: missing UTF-8 name flag for", info.filename)
+            sys.exit(1)
+print("zip entries=%d raw=%.1fMB out=%.1fMB" % (
+    count, total / 1048576, os.path.getsize(dst) / 1048576))
+'@
+
 # ---- dependency sync (off by default) ----
 if ($Sync) {
     Info "uv sync (this PRUNES packages outside the lockfile) ..."
@@ -57,7 +93,7 @@ if ($Sync) {
 # ---- PyInstaller ----
 Info "running PyInstaller (first run is slow) ..."
 $env:AAE_EXE_NAME = $exeName
-$specPath = Join-Path $Root 'packaging\arknight-auto-editing.spec'
+$specPath = Join-Path $Root 'arknight.spec'
 $distPath = Join-Path $Root 'dist'
 $workPath = Join-Path $Root 'build'
 $pyi = Join-Path $Root '.venv\Scripts\pyinstaller.exe'
@@ -98,12 +134,18 @@ function New-Stage([string]$name) {
 
 function New-Zip([string]$stage, [string]$zip) {
     if (Test-Path $zip) { Remove-Item -Force $zip }
-    # Use Python's zipfile: it sets the UTF-8 name flag for non-ASCII entries.
-    # .NET CreateFromDirectory with entryNameEncoding does NOT set that flag, which
-    # makes the Chinese exe name unreadable for extractors (Explorer errors out with
-    # "Illegal characters in path").
-    Invoke-Native 'zip' {
-        & $py (Join-Path $Root 'packaging\make_zip.py') $stage $zip
+    # 用 Python 的 zipfile：非 ASCII 条目名会带上 UTF-8 标志位。
+    # .NET 的 CreateFromDirectory 传 entryNameEncoding 时不置该标志位，中文 exe 名
+    # 在解压端会变乱码（Explorer 直接报 Illegal characters in path）。
+    # 代码走临时文件而不是 python -c：PowerShell 5.1 传原生参数时会吃掉内嵌引号。
+    $tmpPy = Join-Path $env:TEMP ("aae_zip_" + [guid]::NewGuid().ToString("N") + ".py")
+    try {
+        Set-Content -Path $tmpPy -Value $ZipCode -Encoding UTF8
+        Invoke-Native 'zip' {
+            & $py $tmpPy $stage $zip
+        }
+    } finally {
+        Remove-Item $tmpPy -Force -ErrorAction SilentlyContinue
     }
     if (-not (Test-Path $zip)) { throw "zip not produced: $zip" }
     Info ("zip {0} ({1:N1} MB)" -f (Split-Path -Leaf $zip), ((Get-Item $zip).Length / 1MB))
