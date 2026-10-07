@@ -3,14 +3,13 @@
 import tkinter as tk
 from tkinter import ttk, filedialog
 import os
+import sys
 import multiprocessing   # ProcessPoolExecutor 需要在入口处 freeze_support
 
 from settings_panel import SettingsPanel
 from preview_player import VideoPreviewPlayer
 
 
-<<<<<<< Updated upstream
-=======
 def _run_check() -> int:
     """无界面自检：打包后的 exe 用它验证依赖/模板/ffmpeg 是否都带全了。
 
@@ -170,7 +169,6 @@ def _run_check() -> int:
     return 0 if ok else 1
 
 
->>>>>>> Stashed changes
 def main():
     root = tk.Tk()
     root.title("明日方舟剪辑工具")
@@ -232,4 +230,6 @@ if __name__ == "__main__":
     # Windows 下用 PyInstaller/cx_Freeze 打包时必须调用，
     # 否则 ProcessPoolExecutor 会递归启动子进程崩溃
     multiprocessing.freeze_support()
+    if "--check" in sys.argv:
+        raise SystemExit(_run_check())
     main()

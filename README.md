@@ -9,9 +9,6 @@
 对于1倍速事件与0.2倍速事件可倍速播放  
 默认参数已经有较好的剪辑效果  
 还提供了时间轴用于暂停事件的精细化调整与视频预览  
-<<<<<<< Updated upstream
-目前是纯python版本，瓶颈在H.264解码
-=======
 
 ## 性能（本机实测：RTX 4060 Laptop + 20 线程，40s 1080p60 HEVC 素材 2400 帧）
 
@@ -82,7 +79,6 @@ max|Δ| ≤ 1e-6，分类一致率 2400/2400（100%）。任何后端只要偏�
   控制台，以前这些信息是看不到的），可点「查看完整日志」。
 * **导出页**：编码器（实测可用的排前面）、编码速度预设（随编码器切换）、
   导出并发数、极速无损模式、**真实进度 + 剩余时间 + 取消导出**。
->>>>>>> Stashed changes
 
 ## uv 安装
 
@@ -96,21 +92,80 @@ uv run arknight-auto-editing
 ```bash
 uv pip install -r requirements.txt
 ```
+
+### 可选：CUDA 匹配加速（NVIDIA）
+
+不装也能跑（匹配自动回退 OpenCL / CPU）：
+
+```bash
+uv pip install --index-url https://download.pytorch.org/whl/cu128 torch
+```
+
+或直接用程序「性能/GPU」页的「下载并启用」，或 `packaging/gpu_pack.ps1` 构建离线加速包。
+
+## 打包发布
+
+```powershell
+powershell -File packaging\build.ps1
+```
+
+产物（`dist\`）：
+
+* `v<版本>-win.zip` 主包：`剪暂停<版本>.exe` + 8 个模板/源图目录，顶层形态与
+  `v26.7.23-win.zip` 一致；exe 为 onefile/windowed（本机实测 80MB）。
+* `v<版本>-win-full.zip` 完整包：主包再内置 `ffmpeg.exe`/`ffprobe.exe`（约 217MB）
+  与 `uv.exe`，开箱即用硬件解码/编码与程序内下载 CUDA 加速包。
+
+> `build.ps1` 与 `gpu_pack.ps1` 刻意保持纯 ASCII：Windows PowerShell 5.1 会把
+> 无 BOM 的 UTF-8 脚本按 ANSI 解析，中文会破坏语法。
+>
+> 默认不执行 `uv sync`（它会清理锁文件之外的包）；需要时加 `-Sync`。
+
+自检（打包后可直接验证依赖/模板/ffmpeg，以及跑一次真实分析）：
+
+```powershell
+dist\剪暂停26927.exe --check --video tools\fixtures\ref40s.mp4
+```
+
+结果写在 exe 同目录的 `check-report.txt`。
+
+## 测试与基准
+
+```powershell
+powershell -File tools\make_fixture.ps1      # 切出 40s 测试片段（其余脚本都依赖它）
+uv run python tools\selftest.py              # 等价性自检（NCC 公式/热点函数/一致率/UI 接线）
+uv run python tools\bench.py all             # 基准：匹配 / 解码 / 导出 / 编码器
+uv run python tools\bench.py match           # 只跑某一项
+```
+
+`tools\bench.py` 的结果写在 `tools\out\*.json`；素材与产物都在 .gitignore 里。
+
+> `packaging\*.ps1` 与 `tools\make_fixture.ps1` 刻意保持纯 ASCII：Windows
+> PowerShell 5.1 会把无 BOM 的 UTF-8 脚本按 ANSI 解析，中文会破坏语法。
+>
+> `build.ps1` 默认不执行 `uv sync`（它会清理锁文件之外的包）；需要时加 `-Sync`。
+
+自检（打包后可直接验证依赖/模板/ffmpeg，以及跑一次真实分析）：
+
+```powershell
+dist\剪暂停26106.exe --check --video tools\fixtures\ref40s.mp4
+```
+
+结果写在 exe 同目录的 `check-report.txt`。
+
+## 代码结构
+
+| 模块 | 职责 |
+|---|---|
+| `analyzer.py` | 模板加载 + 段落提取 + 删除掩码（并 re-export 其余模块的入口） |
+| `pipeline.py` | 解码后端（含硬件解码）+ 读帧/批处理流水线 + 帧差向量化 |
+| `matcher.py` | 掩码 NCC 多后端（CUDA/OpenCL/CPU）+ 自动测速选路 |
+| `gpu_caps.py` | GPU/FFmpeg 能力实测、编码参数、解码变体、可选 CUDA 加速包 |
+| `exporter.py` | 导出阶梯：无损直通 / 分块并行 / 滤镜编码 / 逐帧兜底 |
+| `app_core.py` | 配置与缓存持久化 + 运行事件出口 |
+| `video_io.py` / `preview_player.py` / `timeline_widget.py` / `settings_panel.py` | 预览、时间轴与界面 |
+
 ```
 链接: https://pan.baidu.com/s/1_LF18ARW5CLo62MeSYMVpQ?pwd=2333
 提取码: 2333
-```
-```
-cap.read
-  视频解码 (BGR 原始尺寸)                                3.62 ms/帧  (276 fps)  
-Resize + ColorConvert  
-  读帧线程内串行预处理                                  10.11 ms/帧  (99 fps)  
-  4线程并行预处理 (ThreadPool)                        3.73 ms/帧  (268 fps)  
-_classify_gray  
-  单核分类耗时                                           0.26 ms/帧  (3895 fps)  
-进程间通信 (IPC) 负载模拟  
-  Pickle 灰度图 (400x225): 0.009 ms
-  Pickle 原始帧 (2560x1440): 2.130 ms
-端到端速度
-  4.25 ms/帧  (235 fps)
 ```

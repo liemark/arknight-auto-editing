@@ -1,59 +1,9 @@
 .venv
-.kilo
+.hf_cache
+.vscode
+.uvcache
 __pycache__
 build
 dist
 ArknightsAutoEditor_v1.0.zip
 ArknightsAutoEditor.spec
-.vscode
-
-# 本地缓存 (非源码, 可再生): HuggingFace 模型缓存 725 MB, uv 包缓存。
-.hf_cache/
-.uvcache/
-
-# _audio_lab 的打包备份, 6.2 GB。之前没被忽略, 一次 git add . 就会把 6 GB 塞进仓库。
-_audio_lab.zip
-
-# ---- _audio_lab: 只忽略【数据和产物】, .py 源码保持可追踪 ----------------
-# 这些加起来 6.6 GB, 之前完全没被忽略, 一次 git add . 就会全进仓库.
-*.wav
-timeline_*.json
-_audio_lab/out/
-_audio_lab/papers/
-_audio_lab/sfx/
-_audio_lab/long/
-_audio_lab/voice/
-_audio_lab/assets/
-_audio_lab/real/
-_audio_lab/samples/
-_audio_lab/_data/
-# _audio_lab 现在是指向 audio_inverse/data/atoms/ 的目录 junction。
-# 上面那些具体子目录规则对新布局已经失效, 这条兜底防止 junction 被跟踪。
-_audio_lab/
-_audio_lab/ml/*.npy
-_audio_lab/ml/long_meta.json
-_audio_lab/ml/*.npz
-_audio_lab/ml/*.pt
-_audio_lab/ml/ckpt*/
-_audio_lab/ml/_cat*
-_audio_lab/ml/_tir_*
-_audio_lab/ml/eval_report_*_s*.md
-_audio_lab/ml/eval_results*
-
-# ---- audio_inverse: 反相抵消系统 (只忽略生成物, 源码可追踪) ---------------
-# data/ 下同时含【音频源】atoms/ 与【生成物】manifest/atomlib/bank/logs/ckpt,
-# 全部不跟踪 (音频源 3.6 GB + 生成物 3.2 GB)。
-audio_inverse/data
-audio_inverse/out
-audio_inverse/**/*.pt
-audio_inverse/**/*.pth
-audio_inverse/**/__pycache__/
-*.zip
-*.log
-*.err
-*.pt
-*.m4a
-*.bak
-*.npy
-*.npz
-*.i16
