@@ -707,6 +707,10 @@ def bench_cache_key(compiled: CompiledTemplates, profile, proc_res: tuple) -> st
     return (f"v{AUTOTUNE_VERSION}|{compiled.signature()}|{prof_sig}|"
             f"{int(proc_res[0])}x{int(proc_res[1])}")
 
+resolve_ffmpeg_path = gpu_caps.resolve_ffmpeg_path
+normalize_decode_backend = pipeline.normalize_decode_backend
+resolve_decode_backend = pipeline.resolve_decode_backend
+decode_backend_label = pipeline.decode_backend_label
 
 def cached_choice(key: str) -> dict | None:
     entry = app_core.load_bench().get(key)
@@ -913,22 +917,10 @@ def _duration_ok(path: str, expected_frames: int, fps: float,
 
 
 def _count_tolerance(n_ranges: int) -> int:
-    """帧数校验容差。
-
-    区间多时也不能放宽到几十帧，否则「只出了 8 帧」这种截断成品会被当成
-    「存疑但正确」放行。
-    """
     return max(2, min(16, n_ranges))
 
 
 def _mp4_keyframes(path: str) -> list[int] | None:
-    """从 MP4/MOV 容器的 stss 索引直接读关键帧帧号（0 基）。
-
-    只读 moov 里的小索引表，不开解码器、不扫全片，长片也是毫秒级；
-    ffprobe 的 -skip_frame nokey 需要读完整个文件的包，既慢又可能中途出错
-    只拿到前半段（实测 56 分钟素材只扫到前 17 分钟，导致靠后的分块拿不到
-    锚点、只能从第 0 帧开始解码）。读不到就返回 None，调用方回退 ffprobe。
-    """
     if not path.lower().endswith(('.mp4', '.mov', '.m4v', '.m4a')):
         return None
     import struct
@@ -1015,15 +1007,9 @@ def _index_partial(frames, video_path: str, fps: float = 0.0,
         total = int(dur * fps) if dur > 0 else 0
     return bool(total) and int(frames[-1]) < total * ratio
 
-
 def keyframe_frames(video_path: str, fps: float,
                     ffmpeg_path: str | None = None,
                     status_cb=None) -> list[int]:
-    """关键帧帧号列表（时间戳×fps 折算，CFR 下准确）。
-
-    扫描要读完整个文件的包索引，长片很慢，因此结果按「路径+mtime+大小」
-    同时缓存在内存和磁盘（重启程序后不必重扫）。
-    """
     try:
         stat = os.stat(video_path)
         key = (f"{os.path.normcase(os.path.abspath(video_path))}|"
