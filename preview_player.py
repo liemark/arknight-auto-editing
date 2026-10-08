@@ -81,6 +81,24 @@ class VideoPreviewPlayer(tk.Frame):
         self.settings.cancel_segment_export_callback = self.cancel_segment_export
         self.timeline.on_pause_select_cb = self._on_timeline_pause_select
         self.timeline.on_mask_changed_cb = self._invalidate_skip_cache
+        # 按钮状态自愈：万一某次导出异常退出留下「灰按钮」，这里会把它恢复
+        self.after(1000, self._sync_export_buttons)
+
+    def _sync_export_buttons(self) -> None:
+        """按钮灰着但其实没有任务在跑时，把状态修回来（防止点击无反应）。"""
+        try:
+            if not self._export_running and \
+                    str(self.settings.export_btn['state']) == tk.DISABLED:
+                self.settings.set_export_running(False)
+            if not self._seg_running and \
+                    str(self.settings.segment_export_btn['state']) == tk.DISABLED:
+                self.settings.set_segment_export_running(False)
+        except Exception:
+            pass
+        try:
+            self.after(1000, self._sync_export_buttons)
+        except Exception:
+            pass
 
     # ==========================================================
     #  UI 构建
@@ -786,11 +804,21 @@ class VideoPreviewPlayer(tk.Frame):
                          decode_label: str = "", match_label: str = "",
                          used_ctx: bool = False):
         from tkinter import messagebox
+        # 容器元数据帧数与实际分析帧数可能差一两帧：以实际分析长度为准，
+        # 否则后面时间轴/导出/分片的数组长度对不上（broadcast 报错）。
+        n = int(len(states))
+        if n > 0 and n != int(self.total_frames or 0):
+            app_core.info(f"容器元数据 {int(self.total_frames)} 帧，实际分析 {n} 帧，"
+                          f"按实际长度对齐", "preview")
+            self.total_frames = n
+            if len(diffs) != n:
+                diffs = diffs[:n]
         self.states_array = states
         self.diffs_array = diffs
         self.pause_segments = pauses
         self.speed_segments = speeds
         self.clip_segments = self._build_clip_segments(pauses, self.total_frames)
+        self.timeline.total_frames = self.total_frames
         self._invalidate_skip_cache()
 
         self.timeline.pause_segments = self.pause_segments
@@ -887,34 +915,37 @@ class VideoPreviewPlayer(tk.Frame):
         self.settings.export_status_var.set("准备导出…")
 
         def worker():
-            to_del = analyzer.build_delete_set(
-                self.total_frames, states, self.pause_segments, self.speed_segments,
-                self.clip_segments, p['speedup_1x'], p['speedup_02'], p['speedup_02_factor'])
-
-            # 把「要删多少帧」写进事件区：一眼能看出是分析没判出暂停，还是掩码没删
+            # 整个函数体都在 try 里：以前 build_delete_set / 统计在 try 外面，
+            # 那里一旦抛异常 finally 就不会执行 → 按钮永远灰着、之后点击全无反应。
             try:
-                n_del = int(np.count_nonzero(to_del))
-                n_all = sum(1 for s in self.pause_segments if s.get('mode') == 'all')
-                empty = sum(1 for s in self.pause_segments
-                            if not np.any(np.asarray(s.get('local_del_mask', []))))
-                app_core.info(
-                    f"导出前统计：删除 {n_del}/{self.total_frames} 帧 · "
-                    f"暂停段 {len(self.pause_segments)} 个（整段删 {n_all}，掩码全空 {empty}）· "
-                    f"剪辑段 {len(self.clip_segments)} 个", "export")
-            except Exception:
-                pass
+                to_del = analyzer.build_delete_set(
+                    self.total_frames, states, self.pause_segments, self.speed_segments,
+                    self.clip_segments, p['speedup_1x'], p['speedup_02'],
+                    p['speedup_02_factor'])
 
-            def prog(ratio, written):
-                eta = self._eta_text(ratio, self._export_t0)
-                self.after(0, lambda r=ratio, w=int(written), e=eta: (
-                    self.settings.export_progress_var.set(r * 100),
-                    self.settings.export_status_var.set(f"写入 {int(r * 100)}% · {w} 帧{e}")))
+                # 把「要删多少帧」写进事件区：一眼能看出是分析没判出暂停，还是掩码没删
+                try:
+                    n_del = int(np.count_nonzero(to_del))
+                    n_all = sum(1 for s in self.pause_segments if s.get('mode') == 'all')
+                    empty = sum(1 for s in self.pause_segments
+                                if not np.any(np.asarray(s.get('local_del_mask', []))))
+                    app_core.info(
+                        f"导出前统计：删除 {n_del}/{self.total_frames} 帧 · "
+                        f"暂停段 {len(self.pause_segments)} 个（整段删 {n_all}，掩码全空 {empty}）· "
+                        f"剪辑段 {len(self.clip_segments)} 个", "export")
+                except Exception:
+                    pass
 
-            def phase(text):
-                # 显示当前实际阶段，避免界面一直停在「准备导出…」
-                self.after(0, lambda t=text: self.settings.export_status_var.set(t))
+                def prog(ratio, written):
+                    eta = self._eta_text(ratio, self._export_t0)
+                    self.after(0, lambda r=ratio, w=int(written), e=eta: (
+                        self.settings.export_progress_var.set(r * 100),
+                        self.settings.export_status_var.set(f"写入 {int(r * 100)}% · {w} 帧{e}")))
 
-            try:
+                def phase(text):
+                    # 显示当前实际阶段，避免界面一直停在「准备导出…」
+                    self.after(0, lambda t=text: self.settings.export_status_var.set(t))
+
                 profile = self.ensure_profile()
                 written, total = analyzer.export_video(
                     self.video_path, p['output'], to_del, self.fps, p['quality'], prog,
@@ -943,6 +974,7 @@ class VideoPreviewPlayer(tk.Frame):
                     "已取消", "导出已取消，临时文件已清理。"))
             except Exception as e:
                 err = str(e)
+                app_core.error(f"导出失败: {err}", "preview")
                 self.after(0, lambda: self.settings.export_status_var.set("导出失败"))
                 self.after(0, lambda m=err: messagebox.showerror("导出失败", m))
             finally:
@@ -1060,7 +1092,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.settings.set_segment_export_running(True)
         self.settings.segment_export_progress_var.set(0)
 
-        def worker():
+        def _seg_export_body():
             total = len(segs)
             pad = max(1, len(str(total)))
             if p.get('export_use_gpu', False):
@@ -1148,5 +1180,18 @@ class VideoPreviewPlayer(tk.Frame):
                     f"并发：{max_w} · 编码器：{enc}\n说明：分段导出默认不保留音频。"))
             self._seg_running = False
             self.after(0, lambda: self.settings.set_segment_export_running(False))
+
+        def worker():
+            # 整段包 try：以前尾部才复位标志，中途抛异常会让按钮一直灰着、
+            # 之后点「一键导出」毫无反应。
+            try:
+                _seg_export_body()
+            except Exception as exc:
+                app_core.error(f"分段导出异常: {exc}", "preview")
+                self.after(0, lambda m=str(exc): self.settings.segment_export_status_var.set(
+                    f"失败：{m}"))
+            finally:
+                self._seg_running = False
+                self.after(0, lambda: self.settings.set_segment_export_running(False))
 
         threading.Thread(target=worker, daemon=True).start()

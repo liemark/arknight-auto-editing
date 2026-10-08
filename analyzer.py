@@ -689,8 +689,13 @@ def autotune(compiled: CompiledTemplates, configs: dict, thresholds: dict,
                 r.error = f"分类不一致 {r.flips} 帧（其中 {r.near_threshold} 帧贴近阈值）"
             else:
                 r.ok = True
+            app_core.debug(
+                f"测速 {backend_label(backend)}：{r.ms_per_frame:.4f} ms/帧 · "
+                f"max|Δ|={r.max_delta:.2e} · 不一致 {r.flips}/{n}"
+                + (f" · {r.error}" if r.error else " · 通过"), "matcher")
         except Exception as exc:
             r.error = f"{type(exc).__name__}: {exc}"
+            app_core.debug(f"测速 {backend} 异常：{r.error}", "matcher")
         results.append(r)
 
     passing = [r for r in results if r.ok]
@@ -1091,6 +1096,10 @@ def keyframe_frames(video_path: str, fps: float,
             _KEYFRAME_CACHE[key] = (time.time(), list(frames))
         if frames:
             app_core.save_keyframes(key, frames)
+        app_core.debug(
+            f"关键帧索引 {len(frames)} 个"
+            + ("（MP4 stss 直读）" if probe is None else "（ffprobe 扫描）")
+            + (f"，覆盖 {frames[0]}~{frames[-1]}" if frames else "，不可用"), "exporter")
         return frames
 
 
@@ -1809,12 +1818,18 @@ def export_video(video_path: str, output_path: str, to_del,
             except Exception as exc:
                 app_core.warn(f"关键帧索引不可用，跳过无损直通: {exc}", "exporter")
 
+        app_core.debug(
+            f"导出开始：{len(ranges)} 段 / {written_fast} 帧 / 并发 {workers} / "
+            f"编码器 {gpu_encoder or '自动'} / 音频 {'开' if export_audio else '关'} / "
+            f"预设 {export_preset or '默认'}", "exporter")
+
         if keys:
             try:
                 if _try_copy_export(video_path, output_path, ranges, fps, profile,
                                     ffmpeg_bin, progress_cb, cancel_event,
                                     workers=max(2, workers), keyframes=keys,
                                     status_cb=status_cb, include_audio=export_audio):
+                    app_core.debug("导出路径：无损直通（-c copy + concat）", "exporter")
                     return written_fast, total
             except ExportCancelled:
                 raise
@@ -1829,6 +1844,7 @@ def export_video(video_path: str, output_path: str, to_del,
                                            cancel_event, profile, keyframes=keys,
                                            status_cb=status_cb,
                                            include_audio=export_audio):
+                    app_core.debug("导出路径：分块并行重编码", "exporter")
                     return written_fast, total
             except ExportCancelled:
                 raise
@@ -1840,8 +1856,10 @@ def export_video(video_path: str, output_path: str, to_del,
                 gpu_encoder, export_audio, progress_cb, ffmpeg_path=ffmpeg_bin,
                 preset=export_preset, cancel_event=cancel_event, profile=profile,
                 keyframes=keys, status_cb=status_cb):
+            app_core.debug("导出路径：单遍滤镜", "exporter")
             return written_fast, total
 
+    app_core.debug("导出路径：逐帧兜底", "exporter")
     written, tot = _export_per_frame(
         video_path, output_path, to_del, fps, quality, progress_cb,
         use_gpu=use_gpu, gpu_encoder=gpu_encoder, ffmpeg_path=ffmpeg_path,
@@ -2055,6 +2073,10 @@ TEMPLATE_DIRS = {
 
 IMG_EXTS = ('.png', '.jpg', '.bmp', '.jpeg')
 
+# 匹配时的搜索余量（处理尺度像素）：UI 相对模板源截图可能整体平移，
+# 16 对应原生 1920 宽下的约 77 像素，够覆盖窗口标题栏/窗口位置差。
+_MATCH_PAD = 16
+
 
 def imread_gray(path: str):
     """灰度读图，支持非 ASCII 路径。
@@ -2130,7 +2152,6 @@ def load_templates(proc_res: tuple = (400, 225),
             _, mask = cv2.threshold(ref_img, 10, 255, cv2.THRESH_BINARY)
 
             scale_x, scale_y = proc_res[0] / sw, proc_res[1] / sh
-            ext = 2.0
             tw, th = max(1, int(round(rw * scale_x))), max(1, int(round(rh * scale_y)))
 
             cached_t = None
@@ -2142,13 +2163,16 @@ def load_templates(proc_res: tuple = (400, 225),
             if cached_t is None:
                 cached_t = cv2.resize(ref_img, (tw, th), interpolation=cv2.INTER_AREA)
 
-            erx = max(0, int(rx * scale_x - tw * (ext - 1) / 2))
-            ery = max(0, int(ry * scale_y - th * (ext - 1) / 2))
+            # 搜索窗口用「固定像素余量」而不是模板尺寸的倍数：带窗口标题栏/窗口偏移的
+            # 录制里，UI 相对模板源截图可能整体平移几十个像素（实测 dx≈-65 dy≈+42
+            # 原生像素）。按 2 倍模板算出来的窗口只有 ±半个模板宽，直接漏检。
+            erx = max(0, int(round(rx * scale_x)) - _MATCH_PAD)
+            ery = max(0, int(round(ry * scale_y)) - _MATCH_PAD)
             configs[ctype].append({
                 'roi_orig': (rx, ry, rw, rh),
                 'source_res': (sw, sh),
                 'cached_proc_res': proc_res,
-                'cached_roi': (erx, ery, int(tw * ext), int(th * ext)),
+                'cached_roi': (erx, ery, tw + 2 * _MATCH_PAD, th + 2 * _MATCH_PAD),
                 'cached_t': cached_t,
                 'cached_m': cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST),
             })
@@ -2405,51 +2429,39 @@ def build_segments(states: np.ndarray, diffs: np.ndarray, video_path: str,
         elif curr in (FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X):
             speeds.append({'type': curr, 'start': s_i, 'end': e_i})
 
-    # 边界差分优先取第一遍上下文；不可用则整体回退二次扫片
-    context_records = None
+    # 暂停段的边界差分只用第一遍分析留下的上下文。
+    # 拿不到上下文、或者某段算出来一帧都不该删 → 这一类暂停段不做任何处理：
+    # 帧状态改成 others(正常) 原样直出，既不剪也不参与后续速度处理。
+    records = None
     if pauses and analysis_context is not None:
-        context_records = context_records_for_pauses(analysis_context, pauses, total)
+        records = context_records_for_pauses(analysis_context, pauses, total)
 
-    if pauses and context_records is not None:
-        for p, rec in zip(pauses, context_records):
+    if records is None:
+        if pauses:
+            app_core.info(f"{len(pauses)} 个暂停段没有边界上下文，"
+                          f"按 others 原样输出（不剪）", "analyzer")
+            for p in pauses:
+                states[p['start']:p['end'] + 1] = FRAME_TYPE_NORMAL
+            pauses = []
+    else:
+        kept = []
+        for p, rec in zip(pauses, records):
             diff = float(rec['diff'])
             p['boundary_diff'] = diff
             if diff < boundary_thresh:
                 p['mode'] = 'all'
-        if progress_cb:
-            progress_cb(1.0)
-        return pauses, speeds
+            elif not np.any(np.asarray(p.get('local_del_mask', []))):
+                # 掩码一帧都不删 → 同样按 others 直出
+                states[p['start']:p['end'] + 1] = FRAME_TYPE_NORMAL
+                continue
+            kept.append(p)
+        if len(kept) != len(pauses):
+            app_core.info(f"{len(pauses) - len(kept)} 个暂停段掩码为空，"
+                          f"按 others 原样输出（不剪）", "analyzer")
+        pauses = kept
 
-    if pauses:
-        app_core.info("边界上下文不可用，回退二次扫片", "analyzer")
-        cap = cv2.VideoCapture(video_path)
-        target_indices = sorted(list(set([max(0, p['start'] - 1) for p in pauses] +
-                                        [min(total - 1, p['end'] + 1) for p in pauses])))
-        target_frames = {}
-        curr_idx = 0
-        for target in target_indices:
-            while curr_idx < target:
-                cap.grab()
-                curr_idx += 1
-            ret, frame = cap.read()
-            if ret:
-                target_frames[target] = cv2.cvtColor(
-                    cv2.resize(frame, proc_res, interpolation=cv2.INTER_AREA),
-                    cv2.COLOR_BGR2GRAY)
-            curr_idx += 1
-        cap.release()
-
-        for p in pauses:
-            b_idx = max(0, p['start'] - 1)
-            a_idx = min(total - 1, p['end'] + 1)
-            if b_idx in target_frames and a_idx in target_frames:
-                diff = float(cv2.mean(cv2.absdiff(target_frames[b_idx],
-                                                  target_frames[a_idx]))[0])
-                p['boundary_diff'] = diff
-                if diff < boundary_thresh:
-                    p['mode'] = 'all'
-        if progress_cb:
-            progress_cb(1.0)
+    if progress_cb:
+        progress_cb(1.0)
 
     return pauses, speeds
 
@@ -2492,10 +2504,22 @@ def build_delete_set(total: int, states: np.ndarray,
                      clip_segments: list,
                      speedup_1x: bool, speedup_02: bool,
                      speedup_02_factor: int) -> np.ndarray:
-    del_mask = np.zeros(total, dtype=bool)
+    # 容器元数据帧数与实际分析帧数可能差一两帧（末帧索引/时间戳问题）。
+    # 一律按「实际分析长度」对齐，否则 del_mask 与 _speedup_mask 长度不同会直接
+    # 报 operands could not be broadcast together。
+    n = int(total)
+    if states is not None and len(states) != n:
+        n = min(n, len(states)) if len(states) > 0 else n
+    n = max(0, n)
+    del_mask = np.zeros(n, dtype=bool)
+    if n == 0:
+        return del_mask
 
     for seg in pause_segments:
-        s, e = seg['start'], seg['end']
+        s, e = int(seg['start']), int(seg['end'])
+        if s >= n:
+            continue
+        e = min(e, n - 1)
         m = seg.get('local_del_mask')
         if seg.get('mode') == 'all' or m is None or len(m) != e - s + 1:
             # 边界是渐变（boundary_diff 小）→ 整段删掉，这是最干脆的剪法
@@ -2505,21 +2529,24 @@ def build_delete_set(total: int, states: np.ndarray,
             del_mask[s:e + 1] = (m == 1) | (m == 2)
 
     for seg in clip_segments:
-        s, e = seg['start'], seg['end']
+        s, e = int(seg['start']), int(seg['end'])
+        if s >= n:
+            continue
+        e = min(e, n - 1)
         ki, ko = seg['keep_in'], seg['keep_out']
         if ki > ko:
             del_mask[s:e + 1] = True
         else:
             if ki > s:
-                del_mask[s:ki] = True
+                del_mask[s:min(ki, n)] = True
             if ko < e:
-                del_mask[ko + 1:e + 1] = True
+                del_mask[max(ko + 1, 0):e + 1] = True
 
     if speedup_1x:
-        del_mask |= _speedup_mask(states, FRAME_TYPE_1X, 2, del_mask)
+        del_mask |= _speedup_mask(states[:n], FRAME_TYPE_1X, 2, del_mask)
 
     if speedup_02 and speedup_02_factor > 1:
-        del_mask |= _speedup_mask(states, FRAME_TYPE_0_2X, speedup_02_factor, del_mask)
+        del_mask |= _speedup_mask(states[:n], FRAME_TYPE_0_2X, speedup_02_factor, del_mask)
 
     return del_mask
 

@@ -15,12 +15,12 @@
 [PASS] CUDA 匹配加速  已启用 torch 2.11.0+cu128 · CUDA 12.8 · NVIDIA GeForce RTX 4060 Laptop GPU（本地）
 [INFO] torch_status={'installed': True, 'version': '2.11.0+cu128', 'cuda_available': True, 'device_name': 'NVIDIA GeForce RTX 4060 Laptop GPU', 'cuda_version': '12.8', 'torch_dml': False, 'reason': '', 'device_count': 1, 'source': 'import'}
 [PASS] 匹配后端可用性  torch_cuda, opencl, cpu_batch, cv2_direct, cpu_pool
-[PASS] 端到端分析  2400 帧 / 4.53s / 1.886 ms/帧 / 解码=nv_scale_cuda 匹配=torch_cuda / 状态分布={1: 1565, 4: 835} / context完整=True
+[PASS] 端到端分析  2400 帧 / 5.73s / 2.389 ms/帧 / 解码=nv_scale_cuda 匹配=torch_cuda / 状态分布={1: 1565, 4: 835} / context完整=True
 [INFO] 模板自匹配分数 {'pause': 1.0, 'speed_1x': 1.0, 'speed_2x': 1.0, 'speed_0_2x': 1.0}
-[AUTOTUNE] torch_cuda   ok=1 Δ=3.15e-04  0.3508 ms/帧 
-[AUTOTUNE] opencl       ok=1 Δ=5.96e-07  1.6924 ms/帧 
-[AUTOTUNE] cpu_batch    ok=1 Δ=9.24e-07  0.5617 ms/帧 
-[AUTOTUNE] cv2_direct   ok=1 Δ=0.00e+00  1.6491 ms/帧 
+[AUTOTUNE] torch_cuda   ok=1 Δ=3.15e-04  0.3918 ms/帧 
+[AUTOTUNE] opencl       ok=1 Δ=8.64e-07  2.1546 ms/帧 
+[AUTOTUNE] cpu_batch    ok=1 Δ=1.52e-06  1.0573 ms/帧 
+[AUTOTUNE] cv2_direct   ok=1 Δ=0.00e+00  2.4276 ms/帧 
 [AUTOTUNE] cpu_pool     ok=0 Δ=0.00e+00  0.0000 ms/帧 不参与自动测速（兼容保留）
 [AUTOTUNE] 已选 torch_cuda
 [PASS] multiprocessing.freeze_support
