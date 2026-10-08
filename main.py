@@ -18,16 +18,32 @@ def _run_check() -> int:
     import traceback
     lines = []
     ok = True
+    report = os.path.join(
+        os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
+                                       else __file__)), "check-report.txt")
+
+    def flush():
+        # 每步落盘：原生 abort（如 DLL 冲突）不会给 traceback，只能靠已写出的内容定位
+        try:
+            with open(report, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except OSError:
+            pass
 
     def add(name, good, detail=""):
         nonlocal ok
         ok = ok and bool(good)
         lines.append(f"[{'PASS' if good else 'FAIL'}] {name}" + (f"  {detail}" if detail else ""))
+        flush()
+
+    def note(text):
+        lines.append(text)
+        flush()
 
     add("Python", True, sys.version.split()[0])
     # frozen 只作信息：源码运行时为 False 属于正常，不算失败
-    lines.append(f"[INFO] frozen={bool(getattr(sys, 'frozen', False))} "
-                 f"meipass={getattr(sys, '_MEIPASS', '')}")
+    note(f"[INFO] frozen={bool(getattr(sys, 'frozen', False))} "
+         f"meipass={getattr(sys, '_MEIPASS', '')}")
 
     try:
         import numpy
@@ -70,9 +86,21 @@ def _run_check() -> int:
 
     try:
         import gpu_caps
-        add("CUDA 匹配加速", True, gpu_caps.pack_status_text())
+        pack = gpu_caps.torch_dir()
+        note(f"[INFO] torch_dir={pack} "
+             f"has_torch={os.path.isdir(os.path.join(pack, 'torch'))}")
+        gpu_caps._register_paths(pack)
+        note("[STEP] pack dir registered, importing torch ...")
+        import torch  # noqa: F401
+        note(f"[STEP] torch imported: {torch.__version__} ({torch.__file__})")
+        note(f"[STEP] cuda_available={torch.cuda.is_available()}")
+        note(f"[STEP] device={torch.cuda.get_device_name(0) if torch.cuda.is_available() else '-'}")
+        st = gpu_caps.torch_status(refresh=True)
+        add("CUDA 匹配加速", bool(st.get("cuda_available")), gpu_caps.pack_status_text())
+        note(f"[INFO] torch_status={st}")
     except Exception as exc:
-        add("CUDA 匹配加速", False, repr(exc))
+        add("CUDA 匹配加速", False, f"{type(exc).__name__}: {exc}")
+        note("[TRACE] " + traceback.format_exc())
 
     try:
         import matcher
@@ -106,18 +134,36 @@ def _run_check() -> int:
                 f"状态分布={uniq} / context完整={ctx.get('complete')}")
         except Exception as exc:
             add("端到端分析", False, f"{type(exc).__name__}: {exc}")
+
+        # 模板自匹配 + 自动测速（与界面里「测速」走的同一条路）
+        try:
+            import matcher
+            proc = (400, 225)
+            cfgs, _n = analyzer.load_templates(proc)
+            self_scores = analyzer.template_self_scores(cfgs, proc)
+            note("[INFO] 模板自匹配分数 " +
+                 str({k: round(v, 4) for k, v in self_scores.items()}))
+            low = [k for k, v in self_scores.items() if v < thr.get(k, 0.7) + 0.05]
+            if low:
+                note(f"[WARN] 模板自匹配余量不足（真实视频上容易漏判/串类）: {low}")
+            sample = matcher.sample_gray_frames(video, proc, count=32,
+                                                decode_backend="auto")
+            compiled = matcher.compile_templates(
+                cfgs, proc, frame_wh=(sample.shape[2], sample.shape[1]))
+            results, chosen = matcher.autotune(compiled, cfgs, thr, proc, sample)
+            for r in results:
+                note(f"[AUTOTUNE] {r.backend:<12} ok={int(r.ok)} "
+                     f"Δ={r.max_delta:.2e} {r.ms_per_frame:7.4f} ms/帧 {r.error}")
+            note(f"[AUTOTUNE] 已选 {chosen}")
+        except Exception as exc:
+            note(f"[WARN] 模板自匹配/测速检查失败: {type(exc).__name__}: {exc}")
     elif video:
         add("端到端分析", False, f"视频不存在: {video}")
 
     add("multiprocessing.freeze_support", True)
 
-    report = os.path.join(os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
-                                                          else __file__)), "check-report.txt")
-    try:
-        with open(report, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + f"\n\n结果: {'全部通过' if ok else '有失败项'}\n")
-    except OSError:
-        pass
+    note(f"\n结果: {'全部通过' if ok else '有失败项'}")
+    flush()
     for line in lines:
         print(line, flush=True)
     return 0 if ok else 1

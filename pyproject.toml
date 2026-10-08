@@ -1,6 +1,6 @@
 [project]
 name = "arknight-auto-editing"
-version = "26.10.6"
+version = "26.10.7"
 description = "明日方舟剪辑工具"
 requires-python = ">=3.10"
 dependencies = [

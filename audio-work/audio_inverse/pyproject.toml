@@ -1,0 +1,26 @@
+[project]
+name = "audio-inverse"
+version = "2.0.0"
+description = "明日方舟音效/语音反相抵消系统: 在变换族上的稀疏逼近 x ≈ Σ g_i·T_θ(a_i) + background"
+requires-python = ">=3.11"
+# 说明: 依赖与本仓库前端的 pyproject.toml 完全隔离, 不要混用。
+# 安装: 见 requirements-cu128.txt (torch 需 cu128 轮子)
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.11",
+    "soundfile>=0.12",
+    "soxr>=0.4",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# train/ 下的训练与识别脚本需要: torch (cu128 轮子) + audiomentations(变体增广) + ffmpeg(模板库的 AAC 档)
+train = [
+    "torch>=2.4",
+    "audiomentations>=0.37",
+]
+
+[tool.setuptools]
+# 只列真正存在于包里的子包。train/ 不是包（是脚本目录），不进这里。
+packages = ["audio_inverse", "audio_inverse.synth", "audio_inverse.models",
+            "audio_inverse.detector", "audio_inverse.postproc"]

@@ -288,8 +288,23 @@ def _qp_from_quality(quality: int) -> int:
     return 18 + (10 - q)
 
 
+def _sane_preset(enc: str, preset: str | None) -> str | None:
+    """预设与编码器不匹配时退回该编码器的默认值。
+
+    典型情况：界面里把编码器从 libx264 换成 h264_nvenc，但预设下拉还留着
+    x264 的 veryfast → ffmpeg 直接报 "Error setting option preset"，导出全失败。
+    """
+    if not preset:
+        return None
+    options = preset_options(enc)
+    if options and preset not in options:
+        return None
+    return preset
+
+
 def encoder_cmd_args(enc: str, quality: int, preset: str | None = None) -> list[str]:
     qp = str(_qp_from_quality(quality))
+    preset = _sane_preset(enc, preset)
     if enc.endswith("_nvenc"):
         args = ["-c:v", enc, "-preset", preset or default_preset(enc),
                 "-tune", "hq", "-rc", "vbr", "-cq", qp, "-b:v", "0"]

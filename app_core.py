@@ -245,16 +245,31 @@ def clear_caches() -> None:
 #  因此统一走这里：环形缓冲留历史，订阅者即时收到（UI 自行切回主线程）。
 # ===============================================================
 
+LEVEL_DEBUG = "debug"
 LEVEL_INFO = "info"
 LEVEL_WARN = "warn"
 LEVEL_ERROR = "error"
 
-_LEVEL_LABEL = {LEVEL_INFO: "信息", LEVEL_WARN: "降级", LEVEL_ERROR: "错误"}
-_MAX_EVENTS = 300
+_LEVEL_LABEL = {LEVEL_DEBUG: "调试", LEVEL_INFO: "信息",
+                LEVEL_WARN: "降级", LEVEL_ERROR: "错误"}
+_MAX_EVENTS = 500
 
 _events: deque = deque(maxlen=_MAX_EVENTS)
 _callbacks: list = []
 _echo_to_stdout = True
+_debug_enabled = False
+
+
+def set_debug(enabled: bool) -> None:
+    """调试信息开关：关闭时也会记录（便于事后打开查看），但不打印到 stdout。"""
+    global _debug_enabled
+    with _lock:
+        _debug_enabled = bool(enabled)
+
+
+def debug_enabled() -> bool:
+    with _lock:
+        return _debug_enabled
 
 
 def set_echo(enabled: bool) -> None:
@@ -263,15 +278,16 @@ def set_echo(enabled: bool) -> None:
         _echo_to_stdout = bool(enabled)
 
 
-def report(level: str, message: str, source: str = "") -> dict:
+def report(level: str, message: str, source: str = "", echo: bool = True) -> dict:
     level = level if level in _LEVEL_LABEL else LEVEL_INFO
     event = {"level": level, "message": str(message),
              "source": str(source or ""), "time": time.time()}
     with _lock:
         _events.append(event)
         callbacks = list(_callbacks)
-        echo = _echo_to_stdout
-    if echo:
+        echo = bool(echo) and _echo_to_stdout and (level != LEVEL_DEBUG or _debug_enabled)
+        do_echo = _echo_to_stdout and echo
+    if do_echo:
         try:
             prefix = f"[{_LEVEL_LABEL.get(level, level)}]"
             if source:
@@ -285,6 +301,11 @@ def report(level: str, message: str, source: str = "") -> dict:
         except Exception:
             pass
     return event
+
+
+def debug(message: str, source: str = "") -> dict:
+    """调试细节：始终记录，界面上由「显示 debug」开关决定是否展示。"""
+    return report(LEVEL_DEBUG, message, source, echo=False)
 
 
 def info(message: str, source: str = "") -> dict:

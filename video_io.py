@@ -1,8 +1,4 @@
 # video_io.py — 视频 IO 线程
-# 整个程序唯一持有 cv2.VideoCapture 的地方，
-# 通过命令队列接收指令，把解码好的帧放入 frame_q。
-#
-# 主线程  ──cmd_q──▶  _VideoIOThread（唯一cap）──frame_q──▶  渲染循环
 
 import cv2
 import numpy as np
@@ -10,6 +6,7 @@ import threading
 import time
 from queue import Queue, Empty
 
+import gpu_caps
 from frame_types import FRAME_TYPE_1X, FRAME_TYPE_0_2X
 
 # ---------- 命令类型常量（导出供外部使用）----------
@@ -35,13 +32,17 @@ class VideoIOThread(threading.Thread):
         self.frame_q = frame_q
         self.cmd_q: Queue = Queue()
 
-        self._cap  = cv2.VideoCapture(path)
+        self._cap  = gpu_caps.open_video_capture(path)
         self.fps   = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
         self.total = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self._cur  = 0
 
         self._playing     = False
         self._play_params: dict = {}
+
+        # 缩放缓冲复用：预览每帧都要 resize，复用缓冲可省掉每帧一次分配
+        self._resize_key = None
+        self._resize_buf = None
 
     # ------------------------------------------------------------------
     # cap 操作（仅本线程调用）
@@ -118,7 +119,17 @@ class VideoIOThread(threading.Thread):
         scale  = min(cw / fw, ch / fh)
         nw     = max(1, int(fw * scale))
         nh     = max(1, int(fh * scale))
-        small  = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        key = (nw, nh)
+        if key == (fw, fh):
+            small = frame
+        else:
+            if key != self._resize_key or self._resize_buf is None:
+                self._resize_key = key
+                self._resize_buf = np.empty((nh, nw, 3), np.uint8)
+            # 缩小用 INTER_AREA：同尺寸下降采样质量更好，速度与 LINEAR 相当
+            cv2.resize(frame, (nw, nh), dst=self._resize_buf,
+                       interpolation=cv2.INTER_AREA)
+            small = self._resize_buf
         rgb    = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         if self.frame_q.full():
             try:

@@ -25,7 +25,6 @@ import numpy as np
 
 import app_core
 import gpu_caps
-import matcher as matcher_mod
 from frame_types import FRAME_TYPE_PAUSE
 
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -469,6 +468,11 @@ def _make_analysis_context(logical_len: int, records: list[dict], complete: bool
             "pause_boundary_diffs": list(records)}
 
 
+# 容器元数据帧数与实际解码帧数常差 1~2 帧（末帧时间戳/索引问题）。
+# 这个量级直接放行：不打印提示，也不因此丢掉第一遍上下文去重扫。
+_FRAME_COUNT_TOLERANCE = 3
+
+
 def context_records_for_pauses(analysis_context, pauses: list, total: int):
     """整体可用才返回 records，否则 None（不混用缓存与重扫结果）。"""
     if not isinstance(analysis_context, dict):
@@ -478,10 +482,11 @@ def context_records_for_pauses(analysis_context, pauses: list, total: int):
             return None
         if analysis_context.get("complete") is not True:
             return None
-        L = int(total)
-        if int(analysis_context.get("frame_count", -1)) != L:
+        L = int(analysis_context.get("frame_count", -1))
+        if L <= 0 or abs(L - int(total)) >= _FRAME_COUNT_TOLERANCE:
             return None
-        if int(analysis_context.get("decoded_frame_count", -1)) != L:
+        if abs(int(analysis_context.get("decoded_frame_count", -1)) - L) \
+                >= _FRAME_COUNT_TOLERANCE:
             return None
         records = analysis_context.get("pause_boundary_diffs")
         if not isinstance(records, list) or len(records) != len(pauses):
@@ -517,7 +522,8 @@ def _finalize_analysis_arrays(states: np.ndarray, diffs: np.ndarray,
         states = states[:decoded]
         diffs = diffs[:decoded]
     L = int(decoded)
-    if not silent and allocated_total > 0 and L < int(allocated_total):
+    gap = int(allocated_total) - L if allocated_total > 0 else 0
+    if not silent and gap >= _FRAME_COUNT_TOLERANCE:
         app_core.info(f"实际解码 {L} 帧 < 容器元数据 {int(allocated_total)} 帧，"
                       f"按实际长度计算上下文完整性", "pipeline")
     if tracker is not None:
@@ -552,6 +558,9 @@ def analyze_video_with_context(
     backend_key = resolve_decode_backend(decode_backend, profile=profile,
                                         ffmpeg_path=ffmpeg_path)
     batch_size = max(1, int(batch_size))
+    # matcher 的实现已并入 analyzer，模块级导入会形成循环依赖（analyzer 在本模块
+    # 初始化期间就取 DECODE_BACKEND_OPENCV），因此改成调用时再导入。
+    import matcher as matcher_mod
     compiled = matcher_mod.compile_templates(configs, proc_res)
     chosen = matcher_mod.resolve_backend(match_backend, profile=profile)
     matcher = matcher_mod.Matcher(compiled, configs, thresholds, proc_res,
@@ -560,6 +569,9 @@ def analyze_video_with_context(
 
     src = make_source(video_path, proc_res, backend_key, n_threads=n_threads,
                       ffmpeg_path=ffmpeg_path)
+    app_core.debug(f"分析参数：解码={backend_key} 匹配={chosen} 批={batch_size} "
+                   f"线程={n_threads} 处理分辨率={proc_res[0]}x{proc_res[1]} "
+                   f"跳过相同帧={skip_identical}", "pipeline")
     total_alloc = max(0, int(src.total or 0))
     use_dynamic = total_alloc <= 0
     states = np.zeros(total_alloc, dtype=np.int8)
@@ -602,6 +614,11 @@ def analyze_video_with_context(
         src.close()
 
     elapsed = max(1e-6, time.perf_counter() - t_start)
+    app_core.debug(
+        f"分析完成：{idx} 帧 / {elapsed:.2f}s / {elapsed * 1000.0 / max(1, idx):.3f} ms/帧"
+        f" · 匹配 {matcher.ms_per_frame:.3f} ms/帧"
+        f" · 跳过相同帧 {matcher.skip_ratio() * 100:.1f}%"
+        f" · 实际解码 {idx} / 容器元数据 {total_alloc}", "pipeline")
     if on_stats:
         try:
             on_stats({

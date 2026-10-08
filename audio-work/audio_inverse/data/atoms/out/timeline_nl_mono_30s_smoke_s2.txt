@@ -1,0 +1,4 @@
+=== timeline: nl_mono_30s.wav ===
+model ckpt_smoke.pt (step 2)  onsets>=0.650  1 events
+
+   16.06s  命中/弹着      p_imp_wtrlime_n(g=0.126,cos=0.20)

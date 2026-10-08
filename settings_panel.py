@@ -188,16 +188,40 @@ class SettingsPanel(ttk.LabelFrame):
         ttk.Progressbar(pack_frame, variable=self.pack_progress,
                         maximum=100).grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=2)
 
-        evt_frame = ttk.LabelFrame(tab_perf, text="运行事件（降级/回退原因都会在这里）", padding=6)
+        evt_frame = ttk.LabelFrame(tab_perf, text="运行状态（实时）", padding=6)
         evt_frame.grid(row=3, column=0, sticky=tk.EW, pady=(6, 0))
         evt_frame.columnconfigure(0, weight=1)
 
-        self.event_text = tk.Text(evt_frame, height=7, width=44, wrap="word",
-                                  font=("Consolas", 8), state=tk.DISABLED,
-                                  background="#111", foreground="#CCC")
-        self.event_text.grid(row=0, column=0, sticky=tk.EW)
-        ttk.Button(evt_frame, text="查看完整日志",
-                   command=self._show_log).grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+        # 内嵌控制台：等宽字体 + 深色，按级别着色，实时追加并自动滚到底
+        self.event_text = tk.Text(
+            evt_frame, height=10, width=44, wrap="none",
+            font=("Consolas", 8), state=tk.DISABLED, relief=tk.FLAT,
+            background="#0d1117", foreground="#c9d1d9",
+            insertbackground="#c9d1d9", padx=6, pady=4, spacing1=0, spacing3=1)
+        self.event_text.grid(row=0, column=0, sticky=tk.NSEW)
+        evt_sb = ttk.Scrollbar(evt_frame, orient=tk.VERTICAL,
+                               command=self.event_text.yview)
+        evt_sb.grid(row=0, column=1, sticky=tk.NS)
+        self.event_text.configure(yscrollcommand=evt_sb.set)
+        self.event_text.tag_configure("debug", foreground="#6e7681")
+        self.event_text.tag_configure("info", foreground="#c9d1d9")
+        self.event_text.tag_configure("warn", foreground="#e3b341")
+        self.event_text.tag_configure("error", foreground="#ff7b72")
+
+        evt_bar = ttk.Frame(evt_frame)
+        evt_bar.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0))
+        self.debug_var = tk.BooleanVar(value=app_core.debug_enabled())
+        ttk.Checkbutton(evt_bar, text="显示 debug", variable=self.debug_var,
+                        command=self._on_debug_toggle).pack(side=tk.LEFT)
+        ttk.Button(evt_bar, text="清空", width=5,
+                   command=self._clear_events).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(evt_bar, text="复制", width=5,
+                   command=self._copy_events).pack(side=tk.LEFT, padx=4)
+        ttk.Button(evt_bar, text="另存…", width=7,
+                   command=self._save_events).pack(side=tk.LEFT)
+        ttk.Button(evt_bar, text="自动滚动", width=9,
+                   command=self._toggle_autoscroll).pack(side=tk.RIGHT)
+        self._autoscroll = True
         self._refresh_events()
 
     # ---- 匹配阈值 ----
@@ -341,6 +365,12 @@ class SettingsPanel(ttk.LabelFrame):
             row=r, column=0, columnspan=3, sticky=tk.W)
         r += 1
 
+        self.no_audio_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tab_export, text="不导出音频（更快）",
+                        variable=self.no_audio_var).grid(
+            row=r, column=0, columnspan=3, sticky=tk.W)
+        r += 1
+
         self.export_btn = ttk.Button(tab_export, text="导出整段剪辑视频", command=self._on_export)
         self.export_btn.grid(row=r, column=0, columnspan=2, pady=8, sticky=tk.W)
         self.cancel_export_btn = ttk.Button(tab_export, text="取消导出",
@@ -409,17 +439,26 @@ class SettingsPanel(ttk.LabelFrame):
         except Exception:
             pass
 
+    def _insert_event(self, event: dict) -> None:
+        text = app_core.format_event(event) + "\n"
+        self.event_text.insert(tk.END, text, event.get("level", "info"))
+
+    def _should_show(self, event: dict) -> bool:
+        if event.get("level") == app_core.LEVEL_DEBUG:
+            return bool(self.debug_var.get())
+        return True
+
     def _append_event(self, event: dict) -> None:
         try:
-            if not self.event_text.winfo_exists():
+            if not self.event_text.winfo_exists() or not self._should_show(event):
                 return
             self.event_text.config(state=tk.NORMAL)
-            self.event_text.insert(tk.END, app_core.format_event(event) + "\n")
-            # 只保留最近 200 行
+            self._insert_event(event)
             lines = int(self.event_text.index("end-1c").split(".")[0])
-            if lines > 200:
-                self.event_text.delete("1.0", f"{lines - 200}.0")
-            self.event_text.see(tk.END)
+            if lines > 400:                       # 只留最近 400 行
+                self.event_text.delete("1.0", f"{lines - 400}.0")
+            if self._autoscroll:
+                self.event_text.see(tk.END)
             self.event_text.config(state=tk.DISABLED)
         except Exception:
             pass
@@ -428,22 +467,50 @@ class SettingsPanel(ttk.LabelFrame):
         try:
             self.event_text.config(state=tk.NORMAL)
             self.event_text.delete("1.0", tk.END)
-            for e in app_core.last_events(40):
-                self.event_text.insert(tk.END, app_core.format_event(e) + "\n")
+            for e in app_core.last_events(300):
+                if self._should_show(e):
+                    self._insert_event(e)
             self.event_text.see(tk.END)
             self.event_text.config(state=tk.DISABLED)
         except Exception:
             pass
 
-    def _show_log(self) -> None:
-        win = tk.Toplevel(self)
-        win.title("运行日志")
-        win.geometry("720x420")
-        text = tk.Text(win, wrap="word", font=("Consolas", 9))
-        text.pack(fill=tk.BOTH, expand=True)
-        text.insert("1.0", app_core.history_text(300))
-        text.config(state=tk.DISABLED)
-        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=4)
+    def _on_debug_toggle(self) -> None:
+        app_core.set_debug(self.debug_var.get())
+        self._refresh_events()
+
+    def _toggle_autoscroll(self) -> None:
+        self._autoscroll = not self._autoscroll
+
+    def _clear_events(self) -> None:
+        try:
+            app_core.clear()
+        except Exception:
+            pass
+        self._refresh_events()
+
+    def _copy_events(self) -> None:
+        try:
+            content = self.event_text.get("1.0", "end-1c")
+            self.clipboard_clear()
+            self.clipboard_append(content)
+            self.event_text.see(tk.END)
+        except Exception:
+            pass
+
+    def _save_events(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="保存运行日志", defaultextension=".txt",
+            initialfile="run-log.txt",
+            filetypes=[("文本文件", "*.txt"), ("全部文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(app_core.history_text(300))
+            messagebox.showinfo("已保存", path)
+        except OSError as exc:
+            messagebox.showerror("保存失败", str(exc))
 
     # ----------------------------------------------------------
     #  硬件探测 / 测速 / 加速包
@@ -724,5 +791,6 @@ class SettingsPanel(ttk.LabelFrame):
             'export_preset': (self.export_preset_var.get() or "").strip(),
             'export_workers': self.export_workers_var.get(),
             'keyframe_copy': self.keyframe_copy_var.get(),
+            'export_audio': not self.no_audio_var.get(),
             'merge_pause_ops': self.merge_pause_ops_var.get(),
         }

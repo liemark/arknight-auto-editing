@@ -1,0 +1,33 @@
+# 训练环境依赖 (Windows + NVIDIA, CUDA 12.8 轮子)
+#
+# 本机 .venv 已经装好 torch 2.11.0+cu128 / torchaudio / faiss-cpu / pyyaml,
+# 所以通常【不需要】执行下面任何命令; 这里只是换机复现时的记录。
+#
+# 检查当前环境:
+#   .venv\Scripts\python.exe -c "import torch,torchaudio,faiss;print(torch.__version__, torch.cuda.is_available())"
+#
+# 复现安装 (在仓库根目录, 使用 uv):
+#   uv pip install --python .venv\Scripts\python.exe ^
+#       torch==2.11.0 torchaudio==2.11.0 ^
+#       --extra-index-url https://download.pytorch.org/whl/cu128
+#   uv pip install --python .venv\Scripts\python.exe faiss-cpu pyyaml
+#
+# 其余依赖 (numpy/scipy/soundfile/soxr/librosa/audiomentations/pyroomacoustics/
+# scaper/pyloudnorm/mir_eval/numba) 已随 .venv 提供, 版本见下表:
+
+torch==2.11.0+cu128
+torchaudio==2.11.0+cu128
+faiss-cpu==1.15.0
+numpy==2.5.1
+scipy==1.18.1
+soundfile==0.14.0
+soxr==0.5.0.post1
+librosa==0.11.0
+pyyaml==6.0.3
+audiomentations==0.43.1
+pyroomacoustics==0.10.1
+scaper==1.6.5
+pyloudnorm==0.2.0
+mir_eval==0.8.2
+numba==0.67.0
+tensorboard>=2.15   # 可选, 缺失时训练自动跳过曲线记录
