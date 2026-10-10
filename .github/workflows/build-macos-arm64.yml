@@ -1,0 +1,130 @@
+name: Build macOS arm64 Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-arm64:
+    name: Build (macOS arm64)
+    runs-on: macos-14
+    # `contents: write` is required for `svenstaro/upload-release-action`
+    # to attach the DMG to a GitHub Release.
+    permissions:
+      contents: write
+    env:
+      APP_NAME: ArknightAutoEditor
+      PYTHON: python3.14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Python 3.14 (Homebrew)
+        run: |
+          brew install python@3.14 python-tk@3.14
+          # GITHUB_PATH only takes effect in *subsequent* steps, so we export
+          # PATH in this step too to make `$PYTHON --version` work here.
+          export PATH="/opt/homebrew/opt/python@3.14/libexec/bin:$PATH"
+          echo /opt/homebrew/opt/python@3.14/libexec/bin >> "$GITHUB_PATH"
+          $PYTHON --version
+
+      - name: Create venv & install deps
+        run: |
+          $PYTHON -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install pyinstaller opencv-python numpy Pillow
+
+      - name: Install ffmpeg & bundle into .kilo/tools
+        run: |
+          brew install ffmpeg
+          mkdir -p .kilo/tools
+          # `brew --prefix ffmpeg` resolves the symlink through opt/ffmpeg ->
+          # Cellar/ffmpeg/<version>/bin/<binary>; use `xargs realpath` so we copy
+          # the real file (not the symlink chain) into the bundle.
+          cp "$(  brew --prefix ffmpeg | xargs realpath )/bin/ffmpeg"   .kilo/tools/ffmpeg
+          cp "$(  brew --prefix ffmpeg | xargs realpath )/bin/ffprobe"  .kilo/tools/ffprobe
+          chmod +x .kilo/tools/ffmpeg .kilo/tools/ffprobe
+          echo "ffmpeg path: $(ls -la .kilo/tools/ffmpeg)"
+          echo "ffprobe path: $(ls -la .kilo/tools/ffprobe)"
+          .kilo/tools/ffmpeg  -version 2>&1 | head -1
+          .kilo/tools/ffprobe -version 2>&1 | head -1
+
+      - name: Build .app with PyInstaller
+        run: |
+          source .venv/bin/activate
+          pyinstaller \
+            --clean \
+            --windowed \
+            --name "$APP_NAME" \
+            --target-arch arm64 \
+            --osx-bundle-identifier com.choimoe.arknight-auto-editor \
+            --add-data "frame_types.py:." \
+            --add-data "analyzer.py:." \
+            --add-data "video_io.py:." \
+            --add-data "preview_player.py:." \
+            --add-data "timeline_widget.py:." \
+            --add-data "settings_panel.py:." \
+            --add-data "templates_pause:templates_pause" \
+            --add-data "templates_play:templates_play" \
+            --add-data "templates_1x:templates_1x" \
+            --add-data "templates_2x:templates_2x" \
+            --add-data "source_images_pause:source_images_pause" \
+            --add-data "source_images_play:source_images_play" \
+            --add-data "source_images_1x:source_images_1x" \
+            --add-data "source_images_2x:source_images_2x" \
+            --add-data ".kilo:.kilo" \
+            main.py
+
+      - name: Verify ffmpeg is bundled & binary is arm64
+        run: |
+          set -e
+          echo "=== bundle contents (arm64?) ==="
+          file "dist/$APP_NAME.app/Contents/MacOS/$APP_NAME"
+          file "dist/$APP_NAME.app/Contents/MacOS/$APP_NAME" | grep -i arm64
+          echo
+          echo "=== locate ffmpeg anywhere under the bundle ==="
+          FFMPEG_PATH="$(find "dist/$APP_NAME.app/Contents" -name ffmpeg -type f -perm -u+x -maxdepth 7 | head -1)"
+          FFPROBE_PATH="$(find "dist/$APP_NAME.app/Contents" -name ffprobe -type f -perm -u+x -maxdepth 7 | head -1)"
+          echo "ffmpeg  -> ${FFMPEG_PATH:-(NOT FOUND)}"
+          echo "ffprobe -> ${FFPROBE_PATH:-(NOT FOUND)}"
+          [ -x "$FFMPEG_PATH"  ] || { echo "❌ ffmpeg missing or not executable";  exit 1; }
+          [ -x "$FFPROBE_PATH" ] || { echo "❌ ffprobe missing or not executable"; exit 1; }
+          "$FFMPEG_PATH"  -version 2>&1 | head -1
+          "$FFPROBE_PATH" -version 2>&1 | head -1
+
+      - name: Create DMG installer
+        run: |
+          brew install create-dmg
+          VOL_NAME="${APP_NAME}_arm64"
+          DMG_NAME="${APP_NAME}-macOS-arm64.dmg"
+          create-dmg \
+            --volname "$VOL_NAME" \
+            --window-size 800 400 \
+            --icon-size 100 \
+            --app-drop-link 600 185 \
+            --icon "$APP_NAME.app" 200 185 \
+            "$DMG_NAME" \
+            "dist/$APP_NAME.app"
+          mv "$DMG_NAME" "dist/$DMG_NAME"
+          echo "DMG created: dist/$DMG_NAME"
+          du -sh "dist/$DMG_NAME"
+
+      - name: Upload DMG as workflow artifact (always available)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-macOS-arm64
+          path: dist/${{ env.APP_NAME }}-macOS-arm64.dmg
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload DMG to GitHub Release (only on tag pushes)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: dist/${{ env.APP_NAME }}-macOS-arm64.dmg
+          tag: ${{ github.ref_name }}
+          overwrite: true
