@@ -532,16 +532,73 @@ _torch_status: dict | None = None
 _dll_handles: list = []          # Windows 需要保持 DLL 目录句柄存活
 
 
-def torch_dir() -> str:
+# C 扩展名里的 ABI 标签：.cp312-win_amd64.pyd / .cp313t-win_amd64.pyd
+_ABI_SUFFIX = re.compile(r"^\.(cp\d+t?)-([0-9A-Za-z_]+)\.(?:pyd|so)$")
+
+
+def interpreter_abi() -> str:
+    """当前解释器的 ABI 标签，如 cp312-win_amd64；判定不了（非 CPython）给空串。"""
+    try:
+        import sysconfig
+        suffix = sysconfig.get_config_var("EXT_SUFFIX") or ""
+    except Exception:
+        return ""
+    m = _ABI_SUFFIX.match(suffix)
+    return f"{m.group(1)}-{m.group(2)}" if m else ""
+
+
+def pack_abi(directory: str) -> str:
+    """加速包里 torch._C 的 ABI 标签；读不到返回空串。喵：包自己会招，看后缀就知道。"""
+    try:
+        names = os.listdir(os.path.join(directory, "torch"))
+    except OSError:
+        return ""
+    for name in names:
+        if name.startswith("_C") and name.endswith((".pyd", ".so")):
+            m = _ABI_SUFFIX.match(name[2:])
+            if m:
+                return f"{m.group(1)}-{m.group(2)}"
+    return ""
+
+
+def abi_python(abi: str) -> str:
+    """cp312-win_amd64 → 3.12（写文案用）。"""
+    m = re.match(r"^cp(\d)(\d+)t?", abi or "")
+    return f"{m.group(1)}.{m.group(2)}" if m else "?"
+
+
+def abi_mismatch_hint(pack_tag: str, here: str) -> str:
+    """版本对不上时的诊断 + 两条出路。喵：直说不匹配，别让人看那句看不懂的 C 扩展报错。"""
+    return (f"加速包是为 Python {abi_python(pack_tag)}（{pack_tag}）构建的，"
+            f"当前解释器是 Python {abi_python(here)}（{here}）：torch 的 C 扩展不跨小版本兼容。"
+            f"两条出路：① 用 Python {abi_python(pack_tag)} 启动本程序，这份包直接可用；"
+            f"② 在「性能 / GPU」页点「下载并启用」，会按当前解释器另装一份"
+            f"（各版本分目录共存，互不覆盖）。")
+
+
+def pack_root() -> str:
+    """加速包根目录（历史布局就是 root/torch）。"""
     return os.path.join(app_core.app_home(), _TORCH_SUBDIR)
 
 
+def torch_dir() -> str:
+    """当前解释器该用的加速包目录：root/<abi>；判定不了 ABI 时退回 root。"""
+    abi = interpreter_abi()
+    return os.path.join(pack_root(), abi) if abi else pack_root()
+
+
 def _search_dirs() -> list[str]:
-    dirs = [torch_dir()]
-    bundle = app_core.bundle_dir()
-    base = app_core.base_dir()
-    for d in (os.path.join(bundle, _TORCH_SUBDIR), bundle,
-              os.path.join(base, _TORCH_SUBDIR), base):
+    """当前解释器的分目录优先，其次历史布局（root/torch、torch 直接躺程序目录）。"""
+    abi = interpreter_abi()
+    cands: list[str] = []
+    for i, r in enumerate((app_core.app_home(), app_core.bundle_dir(), app_core.base_dir())):
+        if abi:
+            cands.append(os.path.join(r, _TORCH_SUBDIR, abi))
+        cands.append(os.path.join(r, _TORCH_SUBDIR))
+        if i:                      # 程序目录 / 解包目录下直接躺 torch 的老布局
+            cands.append(r)
+    dirs: list[str] = []
+    for d in cands:
         if d not in dirs:
             dirs.append(d)
     return dirs
@@ -618,6 +675,9 @@ def load_torch(force: bool = False):
 
         module = None
         source = "import"
+        abi = interpreter_abi()
+        abi_errors: list[str] = []
+        abi_tags: list[str] = []
         try:
             import torch  # type: ignore
             module = torch
@@ -626,6 +686,14 @@ def load_torch(force: bool = False):
             pack_errors: list[str] = []
             for d in _search_dirs():
                 if not _has_torch_package(d):
+                    continue
+                tag = pack_abi(d)
+                if abi and tag and tag != abi:
+                    # 喵：版本对不上就先别 import，硬来只会抛一句看不懂的 C 扩展错误
+                    hint = abi_mismatch_hint(tag, abi)
+                    abi_errors.append(hint)
+                    abi_tags.append(tag)
+                    app_core.warn(f"跳过 {d}：{hint}", "gpu")
                     continue
                 try:
                     _register_paths(d)
@@ -641,17 +709,28 @@ def load_torch(force: bool = False):
                                   "gpu")
             if module is None:
                 _torch_module = None
-                # 加速包存在但导入失败时，包内导入的错误才是关键信息
-                reason = ("加速包加载失败：" + " / ".join(dict.fromkeys(pack_errors))
-                          if pack_errors else f"内置导入失败：{first_error}")
+                # 加速包在、但加载不成：ABI 不匹配最该先说，其次才是包内的导入错误
+                if abi_errors:
+                    parts = list(dict.fromkeys(abi_errors))
+                    if pack_errors:      # 喵：并存的异版本包别把当前这版的真因盖掉了
+                        parts.append("当前解释器的包也无法导入："
+                                     + " / ".join(dict.fromkeys(pack_errors)))
+                    reason = " / ".join(parts)
+                elif pack_errors:
+                    reason = "加速包加载失败：" + " / ".join(dict.fromkeys(pack_errors))
+                else:
+                    reason = f"内置导入失败：{first_error}"
                 _torch_status = {"installed": False, "version": "", "cuda_available": False,
                                  "device_name": "", "cuda_version": "", "torch_dml": False,
-                                 "reason": reason}
+                                 "reason": reason, "interpreter_abi": abi,
+                                 "pack_abi": abi_tags[0] if abi_tags else "",
+                                 "abi_mismatch": bool(abi_errors)}
                 return None
 
         _torch_module = module
         status = _probe_torch_module(module)
         status["source"] = source
+        status["interpreter_abi"] = abi
         _torch_status = status
         return module
 
@@ -784,6 +863,18 @@ def _normalize_layout(directory: str) -> None:
         return
 
 
+def _archive_pack(target: str, tag: str) -> str:
+    """版本不匹配的包挪到 root/<它自己的标签>；同盘 rename 很快，挪不动就留在原地。"""
+    dest = os.path.join(pack_root(), tag)
+    if os.path.abspath(dest) == os.path.abspath(target) or os.path.isdir(dest):
+        return target
+    try:
+        shutil.move(target, dest)
+    except OSError:
+        return target
+    return dest if _has_torch_package(dest) else target
+
+
 def install_from_url(url: str, sha256: str | None = None,
                      progress_cb=None, cancel_event=None) -> tuple[bool, str]:
     """下载并解压 GPU 加速包 zip。"""
@@ -802,6 +893,14 @@ def install_from_url(url: str, sha256: str | None = None,
         _normalize_layout(target)
         if not _has_torch_package(target):
             return False, "加速包解压后没有找到 torch 目录，包结构可能不对"
+        tag = pack_abi(target)
+        abi = interpreter_abi()
+        if tag and abi and tag != abi:
+            # 喵：离线包是按别人的 Python 打的，先挪进它自己那格，别占着当前解释器的位子
+            moved = _archive_pack(target, tag)
+            extra = (f"（这份包已挪到 {moved}，下次用 Python {abi_python(tag)} 启动就直接可用）"
+                     if moved != target else "")
+            return False, abi_mismatch_hint(tag, abi) + extra
         if progress_cb:
             progress_cb(1.0, "完成")
         st = torch_status(refresh=True)
@@ -861,7 +960,16 @@ def install_with_uv(progress_cb=None, cancel_event=None,
             pass
         return False, f"安装中断: {type(exc).__name__}: {exc}"
     if rc != 0:
-        return False, f"uv 安装失败（退出码 {rc}）：" + "\n".join(lines[-6:])[:500]
+        tail = "\n".join(lines[-6:])[:500]
+        abi = interpreter_abi()
+        low = tail.lower()
+        if abi and any(k in low for k in ("no matching", "no solution", "no wheels",
+                                          "not found", "cannot find")):
+            tail += (f"\n可能没有适配 Python {abi_python(abi)}（{abi}）的 torch 轮子："
+                     f"torch 官方轮子通常滞后于 CPython 新版本。"
+                     f"改用较低版本的 Python 启动本程序，或用 gpu_pack.ps1 "
+                     f"-PythonVersion <版本> 构建离线加速包。")
+        return False, f"uv 安装失败（退出码 {rc}）：" + tail
     if progress_cb:
         progress_cb(1.0, "完成")
     st = torch_status(refresh=True)
@@ -881,7 +989,7 @@ def install(progress_cb=None, cancel_event=None) -> tuple[bool, str]:
 
 
 def uninstall() -> tuple[bool, str]:
-    d = torch_dir()
+    d = pack_root()          # 喵：清就清干净，所有版本一起走
     if not os.path.isdir(d):
         return True, "加速包目录不存在"
     try:
@@ -896,6 +1004,9 @@ def pack_status_text() -> str:
     """加速包状态一行摘要（供 UI 使用）。"""
     st = torch_status()
     if not st.get("installed"):
+        # 喵：版本对不上时 reason 本身就是完整诊断 + 出路，别再包一层
+        if st.get("abi_mismatch"):
+            return st.get("reason", "")
         return "未安装（模板匹配走 OpenCL / CPU）"
     if st.get("cuda_available"):
         src = st.get("source", "")

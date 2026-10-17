@@ -86,18 +86,16 @@ def _run_check() -> int:
 
     try:
         import gpu_caps
+        abi = gpu_caps.interpreter_abi() or "?"
         pack = gpu_caps.torch_dir()
-        note(f"[INFO] torch_dir={pack} "
+        note(f"[INFO] python_abi={abi} torch_dir={pack} "
              f"has_torch={os.path.isdir(os.path.join(pack, 'torch'))}")
-        gpu_caps._register_paths(pack)
-        note("[STEP] pack dir registered, importing torch ...")
-        import torch  # noqa: F401
-        note(f"[STEP] torch imported: {torch.__version__} ({torch.__file__})")
-        note(f"[STEP] cuda_available={torch.cuda.is_available()}")
-        note(f"[STEP] device={torch.cuda.get_device_name(0) if torch.cuda.is_available() else '-'}")
+        # 喵：走真正的加载器（它认 ABI），别自己拼 sys.path 去撞那句看不懂的 C 扩展错误
         st = gpu_caps.torch_status(refresh=True)
-        add("CUDA 匹配加速", bool(st.get("cuda_available")), gpu_caps.pack_status_text())
         note(f"[INFO] torch_status={st}")
+        if not st.get("installed"):
+            note(f"[STEP] torch 不可用：{st.get('reason', '')}")
+        add("CUDA 匹配加速", bool(st.get("cuda_available")), gpu_caps.pack_status_text())
     except Exception as exc:
         add("CUDA 匹配加速", False, f"{type(exc).__name__}: {exc}")
         note("[TRACE] " + traceback.format_exc())

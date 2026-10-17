@@ -75,6 +75,10 @@ max|Δ| ≤ 1e-6，分类一致率 2400/2400（100%）。任何后端只要偏�
 * **CUDA 匹配加速包**（可选，约 2.5GB）：检测到 NVIDIA 且没有可用 CUDA 时会询问；
   也可手动「下载并启用」，或换成离线加速包。下载约 2.75GB；装好后点一次
   「重新测速」即可把匹配切到 CUDA。加速包只有 torch，可放任意可写目录复用。
+  **加速包与 Python 小版本绑定**：torch 的 C 扩展不跨 CPython 小版本兼容
+  （cp312 的包在 3.13 下加载不了，反之亦然），程序按当前解释器分目录取用
+  （`gpu-torch\<abi>`）；版本对不上会直接讲清是哪个版本的包、当前是哪个版本、
+  两条出路各是什么，不再抛「Failed to load PyTorch C extensions」这种看不懂的报错。
 * **运行事件区**：所有降级/回退原因都会出现在这里（打包成 windowed exe 后没有
   控制台，以前这些信息是看不到的），可点「查看完整日志」。
 * **导出页**：编码器（实测可用的排前面）、编码速度预设（随编码器切换）、
@@ -102,6 +106,14 @@ uv pip install --index-url https://download.pytorch.org/whl/cu128 torch
 ```
 
 或直接用程序「性能/GPU」页的「下载并启用」，或 `packaging/gpu_pack.ps1` 构建离线加速包。
+
+> **加速包是按 Python 版本产的，不是通用件**：torch 的 C 扩展（`torch\_C.<abi>.pyd`）
+> 只在同一个 CPython 小版本下能加载。程序内「下载并启用」按当前解释器装，
+> 落到 `%LOCALAPPDATA%\arknight-auto-editing\gpu-torch\<abi>`，多版本互不覆盖；
+> 离线包若与当前解释器不匹配，会原样留档到它自己那版目录，并在界面上说明
+> 包是哪个版本、当前是哪个版本、该怎么办（换 Python 启动 / 按当前解释器重装）。
+> `gpu_pack.ps1` 默认按本机解释器打包（要别的版本用 `-PythonVersion`），
+> 并在 `manifest.json` 里记下 `python_abi`。
 
 ## 打包发布
 
